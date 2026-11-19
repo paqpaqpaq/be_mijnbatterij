@@ -85,7 +85,8 @@
     var r = await gmReq(o);
     if (r.fout) return { ok: false, error: r.fout };
     var j; try { j = JSON.parse(r.text); } catch (e) { return { ok: false, error: 'TenneT gaf geen grafiekdata (HTTP ' + r.status + (/<html/i.test(r.text) ? ', sessie niet geaccepteerd' : '') + ')' }; }
-    if (!j || !Array.isArray(j.series)) return { ok: false, error: 'TenneT-antwoord zonder reeksen' };
+    if (j && /session/i.test(String(j.error || ''))) return { ok: false, geenCookie: true, error: 'TenneT accepteert de sessie niet: deze browser stuurt de sessiecookie niet mee (Safari/Userscripts). Gebruik Chrome of Home Assistant voor historie met TenneT-prijzen.' };
+    if (!j || !Array.isArray(j.series)) return { ok: false, error: 'TenneT-antwoord zonder reeksen' + (j && j.error ? ' (' + String(j.error).slice(0, 120) + ')' : '') };
     // Per ISP-nummer: [tekort, overschot] in €/MWh.
     var rijen = {};
     j.series.forEach(function (s) {
@@ -771,7 +772,10 @@ function bembPage() {
     var sk = 'nl:tennet:' + dk, st = await lees(sk), nu = Date.now(), n = (g.eind - g.start) / Q;
     if (st && st.v === 1 && (st.compleet || (alleenCache && st.rows) || nu - st.at < (st.rows ? 6 : 1) * 3600000)) return st.rows || {};
     if (alleenCache) return (st && st.rows) || {};
+    // Deze browser kan TenneT niet bereiken (geen sessiecookie): een dag niet opnieuw proberen.
+    try { if (+localStorage.getItem('bemb_tennet_geen') > nu - 86400000) return {}; } catch (e) {}
     var a; try { a = await brug({ op: 'tennet', datum: dk.slice(8, 10) + '-' + dk.slice(5, 7) + '-' + dk.slice(0, 4) }); } catch (e) { a = { ok: false, error: e.message }; }
+    if (a && a.geenCookie) try { localStorage.setItem('bemb_tennet_geen', String(nu)); } catch (e) {}
     if (!a || !a.ok) { noteer('TenneT-prijzen ' + dk + ': ' + ((a && a.error) || 'geen antwoord')); await schrijf(sk, { v: 1, at: nu, fout: (a && a.error) || 'geen antwoord' }); return {}; }
     var rows = {}, c = 0;
     Object.keys(a.rijen || {}).forEach(function (i) {
