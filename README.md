@@ -33,7 +33,8 @@ Bij het instellen kies je of je eerst wilt proberen (**proefstand**, standaard u
 **Entiteiten**
 - **Sensoren:** resultaat, handel en besparing vandaag; geladen en ontladen vandaag; SOC; meetdekking; laatste live-verzending; status. De status bevat de activiteitenlog en de verstuurde dagen als attributen.
 - **Knop:** *Nu versturen*.
-- **Service:** `be_mijnbatterij.historie_herstellen` met `vanaf: "2026-08"`. Deze stuurt alle definitieve BE-dagen vanaf die maand opnieuw en vervangt de maandtotalen van volledig berekende maanden.
+- **Service:** `be_mijnbatterij.historie_herstellen` met `vanaf: "2026-08"`. Deze stuurt alle definitieve BE-dagen vanaf die maand opnieuw en vervangt de maandtotalen van volledig berekende maanden (ook handmatig ingevulde). De actie start de historie in de achtergrond en keert direct terug; de voortgang staat in de activiteit van de status-sensor en aan het eind volgt een melding. Tussen BE-verzoeken zit dan 4 seconden (de plugin doet hetzelfde), en een dag die op Mijnbatterij nauwkeuriger staat, wordt niet overschreven.
+- **Hoe compleet is de historie:** geladen/ontladen kWh komen exact uit BE. Voor dagen zonder eigen metingen en prijsarchief (ouder dan ongeveer een maand) wordt de verdeling over huis en net per kwartier geschat en valt de prijs waar BE's eigen prijs onbruikbaar is terug op het daggemiddelde. De besparing valt daardoor eerder te laag dan te hoog uit; zulke dagen krijgen een lage `kwal` en bij meer dan 8 geschatte kwartieren `invalid`.
 
 ## Rekenregels
 

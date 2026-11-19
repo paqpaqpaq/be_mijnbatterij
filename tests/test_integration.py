@@ -38,7 +38,7 @@ async def test_flow_fout_wachtwoord(hass: HomeAssistant, server) -> None:
     assert r["errors"] == {"base": "mb_auth"}
 
 
-async def test_volledig(hass: HomeAssistant, server) -> None:
+async def test_volledig(hass: HomeAssistant, server, monkeypatch) -> None:
     r = await hass.config_entries.flow.async_init(DOMAIN, context={"source": config_entries.SOURCE_USER})
     r = await hass.config_entries.flow.async_configure(r["flow_id"], {**GEGEVENS, "proef": True})
     assert r["type"] is FlowResultType.CREATE_ENTRY, r
@@ -84,8 +84,19 @@ async def test_volledig(hass: HomeAssistant, server) -> None:
     assert any(l and l.get("actief") and l.get("bron") == "ha" for l in labels), labels
     print("  opgeslagen dagen:", sorted(fs.mb_db))
 
+    # Historie draait in de achtergrond: de actie keert direct terug, de voortgang staat in de activiteit.
+    from custom_components.be_mijnbatterij import engine as eng
+    monkeypatch.setattr(eng, "HISTORIE_PAUZE_S", 0.0)
     res = await hass.services.async_call(DOMAIN, "historie_herstellen", {"vanaf": fs.DK[:7]}, blocking=True, return_response=True)
-    print("  historie:", list(res["rapport"].values())[0][:2])
+    assert res["gestart"] == [entry.title], res
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert not entry.runtime_data.engine.historie_bezig
+    act = hass.states.get(eid("sensor", "status")).attributes["activiteit"]
+    assert any(r.startswith(tuple(f"{h:02d}" for h in range(24))) and "Historie " in r for r in act), act
+    from homeassistant.components import persistent_notification as pn
+    meldingen = pn._async_get_or_create_notifications(hass)
+    assert any("historie" in (m.get("title") or "").lower() for m in meldingen.values()), meldingen
+    print("  historie:", [r for r in act if "Historie" in r][:2])
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 

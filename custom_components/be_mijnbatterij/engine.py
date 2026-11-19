@@ -27,7 +27,8 @@ PRIJS_DAGEN = 16
 DEF_DAGEN = 40
 DAG_VENSTER = 10
 HEARTBEAT_S = 15 * 60
-BROWSER_ACTIEF_MS = 25 * 60_000  # browserhartslag (elke 10 min) geldt zo lang
+BROWSER_ACTIEF_MS = 25 * 60_000
+HISTORIE_PAUZE_S = 4.0  # ~15 BE-verzoeken per minuut extra tijdens historie  # browserhartslag (elke 10 min) geldt zo lang
 DAGRONDE_S = 30 * 60
 MAAND_TTL_S = 2 * 3600
 
@@ -57,6 +58,9 @@ class Engine:
         self._maand_cache: dict[str, tuple[float, dict]] = {}
         self._prijs_tik = 0
         self._lock = asyncio.Lock()
+        # Pauze vóór elk BE-verzoek voor een dag/maand; tijdens historie ruimer (verzoekbudget BE).
+        self.be_pauze = 1.25
+        self.historie_bezig = False
         self.vandaag: dict | None = None
         self._tenergy_at = 0.0
         self.tenergy_fout = ""
@@ -254,7 +258,7 @@ class Engine:
                 if st.get("fout"):
                     raise calc.BronFout(st["fout"] + " (eerdere controle)")
                 return {int(q): v for q, v in st["kw"].items()}
-        await self.slaap(1.25)
+        await self.slaap(self.be_pauze)
         j = await self.be.results(await self.installatie(), "day", dk)
         try:
             kw = calc.parse_definitief(j, rij, dk)
@@ -409,72 +413,84 @@ class Engine:
             return None
 
     async def historie(self, van_ym: str, stop: Callable[[], bool] = lambda: False) -> list[str]:
-        async with self._lock:
-            nu = self.now_ms()
-            vk = calc.vandaag(nu)
-            rapport: list[str] = []
-            for ym in calc.maanden(van_ym, vk[:7]):
+        """Alle BE-complete dagen vanaf een maand. Draait in de achtergrond: per dag even het slot,
+        zodat live en de dagronde gewoon doorlopen; elk BE-verzoek met HISTORIE_PAUZE_S ertussen."""
+        if self.historie_bezig:
+            raise BEError("historie loopt al")
+        self.historie_bezig, oude_pauze = True, self.be_pauze
+        self.be_pauze = HISTORIE_PAUZE_S
+        try:
+            return await self._historie(van_ym, stop)
+        finally:
+            self.be_pauze, self.historie_bezig = oude_pauze, False
+
+    async def _historie(self, van_ym: str, stop: Callable[[], bool]) -> list[str]:
+        nu = self.now_ms()
+        vk = calc.vandaag(nu)
+        rapport: list[str] = []
+        for ym in calc.maanden(van_ym, vk[:7]):
+            if stop():
+                rapport.append("Gestopt.")
+                break
+            self.noteer(f"Historie: {ym} …")
+            try:
+                await self.slaap(self.be_pauze)
+                j = await self.maand_bron(ym, 60)
+            except BERateLimited as err:
+                rapport.append(str(err))
+                break
+            except BEError as err:
+                rapport.append(f"{ym}: {err}")
+                continue
+            dagen = sorted(r["date"] for r in j["series"] if isinstance(r, dict) and isinstance(r.get("date"), str)
+                           and r["date"][:7] == ym and r["date"] < vk)
+            try:
+                bestaand = await self.mb.dagen(dagen[0], dagen[-1]) if dagen else {}
+            except MBError as err:
+                rapport.append(f"{ym}: Mijnbatterij {err}")
+                continue
+            som = {"t": 0.0, "b": 0.0, "l": 0.0, "o": 0.0, "n": 0}
+            alles = True
+            for dk in dagen:
                 if stop():
-                    rapport.append("Gestopt.")
                     break
-                try:
-                    await self.slaap(1.25)
-                    j = await self.maand_bron(ym, 60)
-                except BERateLimited as err:
-                    rapport.append(str(err))
-                    break
-                except BEError as err:
-                    rapport.append(f"{ym}: {err}")
+                rij = next((r for r in j["series"] if isinstance(r, dict) and r.get("date") == dk), None)
+                if not rij or rij.get("status") != "complete":
+                    alles = False
                     continue
-                dagen = sorted(r["date"] for r in j["series"] if isinstance(r, dict) and isinstance(r.get("date"), str)
-                               and r["date"][:7] == ym and r["date"] < vk)
                 try:
-                    bestaand = await self.mb.dagen(dagen[0], dagen[-1]) if dagen else {}
-                except MBError as err:
-                    rapport.append(f"{ym}: Mijnbatterij {err}")
-                    continue
-                som = {"t": 0.0, "b": 0.0, "l": 0.0, "o": 0.0, "n": 0}
-                alles = True
-                for dk in dagen:
-                    if stop():
-                        break
-                    rij = next((r for r in j["series"] if isinstance(r, dict) and r.get("date") == dk), None)
-                    if not rij or rij.get("status") != "complete":
-                        alles = False
-                        continue
-                    try:
+                    async with self._lock:
                         r = await self.dag_definitief(dk, rij, False)
                         await self._verstuur_dag(r, bestaand.get(dk), rapport)
-                        w = r["w"]
-                        som["t"] += w["totaal"]; som["b"] += w["besparing"]
-                        som["l"] += w["geladen"]; som["o"] += w["ontladen"]; som["n"] += 1
-                    except BERateLimited as err:
-                        rapport.append(str(err))
-                        return rapport
-                    except (calc.BronFout, BEError, MBError) as err:
-                        alles = False
-                        rapport.append(f"{dk}: {err}")
-                if ym < vk[:7] and alles and som["n"] and som["n"] == len(dagen):
-                    mp = {"yearMonth": ym, "batteryResult": calc.e2(som["t"]), "batterySavings": calc.e2(som["b"]),
-                          "batteryCharged": calc.k3(som["l"]), "batteryDischarged": calc.k3(som["o"]),
-                          "partial": som["n"] < _dagen_in_maand(ym),
-                          "note": f"Som van {som['n']} BE-definitieve dagen. " + calc.maak_label(self.versie, "ha", "be", 1.0)}
-                    import json as _json
-                    h = _json.dumps(mp, sort_keys=True)
-                    if self.proef:
-                        rapport.append(f"{ym}: maandtotaal € {mp['batteryResult']} — proefstand, niet verstuurd.")
-                    elif self.s["maand"].get(ym) != h:
-                        try:
-                            await self.mb.maand(mp)
-                            self.s["maand"][ym] = h
-                            rapport.append(f"{ym}: maandtotaal verstuurd € {mp['batteryResult']}.")
-                        except MBError as err:
-                            rapport.append(f"{ym}: maandtotaal mislukt: {err}")
-                elif ym < vk[:7]:
-                    rapport.append(f"{ym}: {som['n']}/{len(dagen)} dagen definitief; maandtotaal niet vervangen.")
-            for regel in rapport:
-                self.noteer(regel)
-            return rapport
+                    w = r["w"]
+                    som["t"] += w["totaal"]; som["b"] += w["besparing"]
+                    som["l"] += w["geladen"]; som["o"] += w["ontladen"]; som["n"] += 1
+                except BERateLimited as err:
+                    rapport.append(str(err))
+                    return rapport
+                except (calc.BronFout, BEError, MBError) as err:
+                    alles = False
+                    rapport.append(f"{dk}: {err}")
+            if ym < vk[:7] and alles and som["n"] and som["n"] == len(dagen):
+                mp = {"yearMonth": ym, "batteryResult": calc.e2(som["t"]), "batterySavings": calc.e2(som["b"]),
+                      "batteryCharged": calc.k3(som["l"]), "batteryDischarged": calc.k3(som["o"]),
+                      "partial": som["n"] < _dagen_in_maand(ym),
+                      "note": f"Som van {som['n']} BE-definitieve dagen. " + calc.maak_label(self.versie, "ha", "be", 1.0)}
+                import json as _json
+                h = _json.dumps(mp, sort_keys=True)
+                if self.proef:
+                    rapport.append(f"{ym}: maandtotaal € {mp['batteryResult']} — proefstand, niet verstuurd.")
+                elif self.s["maand"].get(ym) != h:
+                    try:
+                        await self.mb.maand(mp)
+                        self.s["maand"][ym] = h
+                        rapport.append(f"{ym}: maandtotaal verstuurd € {mp['batteryResult']}.")
+                    except MBError as err:
+                        rapport.append(f"{ym}: maandtotaal mislukt: {err}")
+            elif ym < vk[:7]:
+                rapport.append(f"{ym}: {som['n']}/{len(dagen)} dagen definitief; maandtotaal niet vervangen.")
+            self.noteer(f"Historie {ym}: {som['n']}/{len(dagen)} dagen, € {calc.e2(som['t'])}")
+        return rapport
 
     def opruimen(self) -> None:
         grens = calc.plus_dagen(calc.vandaag(self.now_ms()), -DEF_DAGEN)

@@ -9,6 +9,7 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_create_clientsession, async_get_clientsession
@@ -39,16 +40,34 @@ async def async_setup_entry(hass: HomeAssistant, entry: BEMBConfigEntry) -> bool
 
     if not hass.services.has_service(DOMAIN, "historie_herstellen"):
         async def historie(call: ServiceCall) -> dict:
-            uit = {}
+            """Start de historie in de achtergrond: een actie die minuten duurt, breekt anders af
+            zodra de verbinding met de frontend wegvalt ("undefined"). Voortgang staat in de
+            activiteit van de status-sensor; aan het eind volgt een melding."""
+            gestart = []
             for e in _geladen(hass):
-                rapport = await e.runtime_data.engine.historie(call.data["vanaf"])
-                e.runtime_data.bewaar()
-                uit[e.title] = rapport
-            return {"rapport": uit}
+                if e.runtime_data.engine.historie_bezig:
+                    raise HomeAssistantError(f"{e.title}: historie loopt al")
+                e.async_create_background_task(hass, _historie_taak(hass, e, call.data["vanaf"]), f"{DOMAIN}_historie")
+                gestart.append(e.title)
+            return {"gestart": gestart, "info": "Voortgang in de activiteit van de status-sensor; aan het eind volgt een melding."}
 
         hass.services.async_register(DOMAIN, "historie_herstellen", historie, schema=SCHEMA_HISTORIE,
                                      supports_response=SupportsResponse.OPTIONAL)
     return True
+
+
+async def _historie_taak(hass: HomeAssistant, entry: BEMBConfigEntry, vanaf: str) -> None:
+    from homeassistant.components import persistent_notification
+    try:
+        rapport = await entry.runtime_data.engine.historie(vanaf)
+        tekst = "\n".join(f"- {r}" for r in rapport[-40:]) or "- niets gewijzigd"
+    except Exception as err:  # noqa: BLE001 — melden in plaats van stil afbreken
+        _LOGGER.exception("Historie mislukt")
+        tekst = f"Mislukt: {err}"
+    entry.runtime_data.bewaar()
+    await entry.runtime_data.async_refresh()
+    persistent_notification.async_create(hass, tekst, title=f"BE Mijnbatterij — historie vanaf {vanaf}",
+                                         notification_id=f"{DOMAIN}_historie_{entry.entry_id}")
 
 
 def _geladen(hass: HomeAssistant) -> list[ConfigEntry]:

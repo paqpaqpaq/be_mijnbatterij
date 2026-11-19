@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BE Mijnbatterij
 // @namespace    paq.balansenergie
-// @version      1.2.5
+// @version      1.2.6
 // @description  Deelt accuresultaten van het Balans Energie-dashboard met mijnbatterij.nl, gesplitst in handel en besparing. Los van Balansenergie All-in; eigen pagina in het menu.
 // @homepageURL  https://github.com/paqpaqpaq/be_mijnbatterij
 // @updateURL    https://raw.githubusercontent.com/paqpaqpaq/be_mijnbatterij/main/userscript/BE-Mijnbatterij.user.js
@@ -77,7 +77,7 @@
         poging++;
         fn({
           method: method, url: API + v.path, timeout: 25000,
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.2.5' },
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.2.6' },
           data: v.body ? JSON.stringify(v.body) : undefined,
           onload: function (r) {
             var ok = r.status >= 200 && r.status < 300, text = String(r.responseText || '');
@@ -103,7 +103,7 @@ function bembPage() {
   if (window.__bembLoaded) return;
   window.__bembLoaded = true;
 
-  var VERSIE = '1.2.5', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
+  var VERSIE = '1.2.6', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
   // Marge (procentpunt): twee verzenders met vrijwel volledige data mogen elkaar vervangen;
   // aanvullen naast HA gebeurt pas bij +1 pp, zodat ze niet pingpongen.
   var TOLERANTIE = 0.5;
@@ -145,6 +145,9 @@ function bembPage() {
   function dagenInMaand(ym) { return new Date(Date.UTC(+ym.slice(0, 4), +ym.slice(5, 7), 0)).getUTCDate(); }
   function getal(n) { return typeof n === 'number' && isFinite(n); }
   function wacht(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  // Pauze vóór elk BE-verzoek voor een dag/maand. Tijdens historie ruimer: BE's limiet is niet
+  // bekend en All-in (en eventueel Home Assistant) gebruikt hetzelfde account.
+  var BE_PAUZE = 1250, HISTORIE_PAUZE = 4000;
 
   /* ── Rekenen (los van DOM, testbaar) ── */
   // Verdeling per meetsegment, zoals Mijnbatterij het voorschrijft:
@@ -717,7 +720,7 @@ function bembPage() {
       if (st.fout) throw Error(st.fout + ' (eerdere controle)');
       return st.kw;
     }
-    await wacht(1250);
+    await wacht(BE_PAUZE);
     var j = await beGet('/customer/' + encodeURIComponent(id) + '/results-v2-api/', { interval: 'day', period: dk, include_vat: '0', include_delivery_cost: '0' });
     try { var kw = parseDefinitief(j, rij, dk); await schrijf(k(id, 'def:' + dk), { v: 2, sig: sig, at: nu, kw: kw }); return kw; }
     catch (e) { await schrijf(k(id, 'def:' + dk), { v: 2, sig: sig, at: nu, fout: e.message }); throw e; }
@@ -958,7 +961,7 @@ function bembPage() {
     var id = klant(), c = cfg(); if (!id) throw Error('Geen installatie bekend');
     if (!/^\d{4}-\d{2}$/.test(vanYm)) throw Error('Kies een startmaand');
     if (historieBezig) throw Error('Historie loopt al');
-    historieBezig = true; historieStop = false;
+    historieBezig = true; historieStop = false; BE_PAUZE = HISTORIE_PAUZE;
     var rapport = [];
     try {
       var gestart = false;
@@ -967,9 +970,16 @@ function bembPage() {
         var vk = vandaag(), lijst = maanden(vanYm, vk.slice(0, 7));
         for (var ym of lijst) {
           if (historieStop) { rapport.push('Gestopt door gebruiker.'); break; }
-          var j; try { await wacht(1250); j = await maandBron(id, ym, 60000); }
+          var j; try { await wacht(BE_PAUZE); j = await maandBron(id, ym, 60000); }
           catch (e) { rapport.push(ym + ': ' + e.message); if (e.pauze) break; continue; }
           var dagen = (j.series || []).map(function (r) { return r && r.date; }).filter(function (d) { return typeof d === 'string' && d.slice(0, 7) === ym && d < vk; }).sort();
+          // Bestaande records ophalen: ook de historie volgt de afstemmingsregel (niets nauwkeurigers overschrijven).
+          var bestaand = {};
+          if (dagen.length) {
+            try { var ba = await mb('GET', '/api/results/daily?from=' + dagen[0] + '&to=' + dagen[dagen.length - 1]), bj = JSON.parse(ba.text);
+              ((bj && bj.results) || []).forEach(function (x) { if (x && x.date) bestaand[String(x.date).slice(0, 10)] = x; }); }
+            catch (e) { rapport.push(ym + ': Mijnbatterij-records niet opgehaald (' + e.message + '); maand overgeslagen.'); continue; }
+          }
           var som = { t: 0, b: 0, l: 0, o: 0, n: 0, alles: true };
           for (var dk of dagen) {
             if (historieStop) break;
@@ -978,7 +988,7 @@ function bembPage() {
             if (!rij || rij.status !== 'complete') { som.alles = false; continue; }
             try {
               var r = await dagDefinitief(id, dk, rij, c, false);
-              await verstuurDag(id, r, c, rapport);
+              await verstuurDag(id, r, c, rapport, bestaand[dk] || null);
               som.t += r.w.totaal; som.b += r.w.besparing; som.l += r.w.geladen; som.o += r.w.ontladen; som.n++;
             } catch (e) { som.alles = false; rapport.push(dk + ': ' + e.message); if (e.pauze) { historieStop = true; break; } }
           }
@@ -996,7 +1006,7 @@ function bembPage() {
         }
       });
       if (!gestart) rapport.push('Er loopt al een dagronde; probeer het zo opnieuw.');
-    } finally { historieBezig = false; }
+    } finally { historieBezig = false; BE_PAUZE = 1250; }
     rapport.forEach(noteer); render();
     return rapport.join('\n');
   }
@@ -1081,7 +1091,7 @@ function bembPage() {
       '<div class="row" style="margin-top:14px"><label class="muted" for="c-afstemming" style="font-size:12px">Afstemming met Home Assistant</label><select id="c-afstemming" style="border:1px solid var(--line);border-radius:7px;background:var(--paper);padding:8px 10px;min-height:38px"><option value="auto">Automatisch: HA verstuurt als die actief is</option><option value="altijd">Altijd zelf versturen</option></select></div>' +
       '<p class="notice" id="ha-state"></p>' +
       '<div class="row" style="margin-top:14px"><label class="muted" for="hist-van" style="font-size:12px">Historie herstellen vanaf</label><input id="hist-van" type="month">' + knop('Herstellen', 'id="hist"') + knop('Stoppen', 'id="hist-stop" hidden') + '</div>' +
-      '<p class="notice">Haalt alle BE-complete dagen vanaf die maand op (ca. 1,3 s per dag), stuurt gewijzigde dagresultaten en vervangt maandtotalen van volledig berekende afgelopen maanden.</p></section>' +
+      '<p class="notice">Haalt alle BE-complete dagen vanaf die maand op (ca. 4 s per dag, om binnen de verzoeklimiet van BE te blijven), stuurt gewijzigde dagresultaten en vervangt maandtotalen van volledig berekende afgelopen maanden.</p></section>' +
       '<details class="panel uitleg"><summary>Rekenregels</summary>' +
       '<p>Per meetsegment krijgt het huis eerst de zonnestroom. Laadt de accu, dan eerst uit het zonne-overschot (gewaardeerd tegen de terugleverprijs die je misloopt) en de rest uit het net (afnameprijs). Ontladen dekt eerst het huis (vermeden afnameprijs), de rest gaat naar het net (terugleverprijs).</p>' +
       '<p>Besparing = ontladen naar huis × afnameprijs − het deel van de laadkosten dat bij die kWh hoort. Handel = ontladen naar net × terugleverprijs − het overige deel van de laadkosten, plus aFRR-vergoedingen. batteryResult = handel + besparing; Mijnbatterij leidt handel daaruit af.</p>' +
@@ -1152,7 +1162,7 @@ function bembPage() {
     try {
       var c = cfg(), id = klant();
       $('pill-auto').textContent = haNeemtOver(c) ? 'Home Assistant verstuurt' : c.auto ? 'automatisch' : 'handmatig';
-      $('ha-state').textContent = haStatus.gecontroleerd ? (haStatus.at ? 'Laatste Home Assistant-heartbeat: ' + new Date(haStatus.at).toLocaleString('nl-NL', { timeZone: TZ, day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) + (haStatus.actief ? ' — HA is actief, de browser verstuurt niets.' : ' — te oud, de browser verstuurt zelf.') : 'Geen Home Assistant-integratie gezien; de browser verstuurt zelf.') : 'Nog niet gecontroleerd.';
+      $('ha-state').textContent = haStatus.gecontroleerd ? (haStatus.at ? 'Laatste Home Assistant-heartbeat: ' + new Date(haStatus.at).toLocaleString('nl-NL', { timeZone: TZ, day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) + (haStatus.actief ? ' — HA is actief, de browser verstuurt niets.' : ' — te oud, de browser verstuurt zelf.') : 'Geen actieve Home Assistant-heartbeat gezien; de browser verstuurt zelf. Draait de integratie wel, dan laat die het versturen aan de browser zolang deze nauwkeurigere dagen heeft (zie de status in HA).') : 'Nog niet gecontroleerd.';
       $('pill-proef').textContent = c.proef ? 'proefstand' : ''; $('pill-proef').hidden = !c.proef;
       $('key-state').textContent = heeftSleutel ? 'Sleutel ingesteld (staat in de userscript-opslag, niet in de pagina).' : 'Nog geen sleutel. Je vindt hem op je Mijnbatterij-profielpagina.';
       $('nu').textContent = c.proef ? 'Nu valideren (proef)' : 'Nu delen';
