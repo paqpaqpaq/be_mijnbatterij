@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BE Mijnbatterij
 // @namespace    paq.balansenergie
-// @version      1.2.6
+// @version      1.3.0
 // @description  Deelt accuresultaten van het Balans Energie-dashboard met mijnbatterij.nl, gesplitst in handel en besparing. Los van Balansenergie All-in; eigen pagina in het menu.
 // @homepageURL  https://github.com/paqpaqpaq/be_mijnbatterij
 // @updateURL    https://raw.githubusercontent.com/paqpaqpaq/be_mijnbatterij/main/userscript/BE-Mijnbatterij.user.js
@@ -77,12 +77,12 @@
         poging++;
         fn({
           method: method, url: API + v.path, timeout: 25000,
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.2.6' },
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.3.0' },
           data: v.body ? JSON.stringify(v.body) : undefined,
           onload: function (r) {
             var ok = r.status >= 200 && r.status < 300, text = String(r.responseText || '');
             if (!r.status && poging < 2) { setTimeout(stuur, 3000); return; }
-            answer({ ok: ok, status: r.status, text: text.slice(0, 20000), error: ok ? '' : (r.status ? 'HTTP ' + r.status + ' — ' + text.slice(0, 300) : 'Geen antwoord van mijnbatterij.nl') });
+            answer({ ok: ok, status: r.status, text: text.slice(0, 2000000), error: ok ? '' : (r.status ? 'HTTP ' + r.status + ' — ' + text.slice(0, 300) : 'Geen antwoord van mijnbatterij.nl') });
           },
           onerror: function (r) {
             if (poging < 2) { setTimeout(stuur, 3000); return; }
@@ -103,7 +103,7 @@ function bembPage() {
   if (window.__bembLoaded) return;
   window.__bembLoaded = true;
 
-  var VERSIE = '1.2.6', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
+  var VERSIE = '1.3.0', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
   // Marge (procentpunt): twee verzenders met vrijwel volledige data mogen elkaar vervangen;
   // aanvullen naast HA gebeurt pas bij +1 pp, zodat ze niet pingpongen.
   var TOLERANTIE = 0.5;
@@ -906,16 +906,21 @@ function bembPage() {
     var r = await dagUitCache(id, dk, null, c);
     return r.dekking >= MIN_DEKKING_VOORLOPIG ? r : null;
   }
-  async function verstuurDag(id, r, c, rapport, bestaand) {
+  async function verstuurDag(id, r, c, rapport, bestaand, uitkomst) {
+    uitkomst = uitkomst || {};
     if (bestaand !== undefined) {
       var regel = magOverschrijven(bestaand, r.bron === 'BE' ? 'be' : 'cache', r.dekking, r.kwal);
-      if (!regel.mag) { rapport.push(r.dk + ': niet vervangen — ' + regel.reden + (((leesLabel(bestaand && bestaand.note) || {}).bron === 'ha') ? ' (Home Assistant)' : '') + '.'); return false; }
+      if (!regel.mag) {
+        uitkomst.wat = 'geweigerd'; uitkomst.reden = regel.reden + (((leesLabel(bestaand && bestaand.note) || {}).bron === 'ha') ? ' (Home Assistant)' : '');
+        rapport.push(r.dk + ': niet vervangen — ' + uitkomst.reden + '.'); return false;
+      }
     }
     var p = dagPayload(r, c), hash = JSON.stringify(p), sk = k(id, (c.proef ? 'proef:' : 'sent:') + r.dk), st = await lees(sk);
-    if (st && st.bron === 'BE' && r.bron !== 'BE') { rapport.push(r.dk + ': definitieve versie al verstuurd; cache niet teruggezet.'); return false; }
+    if (st && st.bron === 'BE' && r.bron !== 'BE') { uitkomst.wat = 'geweigerd'; uitkomst.reden = 'definitieve versie al verstuurd'; rapport.push(r.dk + ': definitieve versie al verstuurd; cache niet teruggezet.'); return false; }
     // Hash alleen vertrouwen als de huidige versie op Mijnbatterij van de browser zelf is.
     var vanAnder = bestaand && ((leesLabel(bestaand.note) || {}).bron || '') !== 'browser';
-    if (st && st.hash === hash && !vanAnder) return false;
+    if (st && st.hash === hash && !vanAnder) { uitkomst.wat = 'ongewijzigd'; return false; }
+    uitkomst.wat = 'verstuurd';
     var body = c.proef ? Object.assign({ test: true }, p) : p;
     await mb('POST', '/api/results/daily', body);
     await schrijf(sk, { hash: hash, bron: r.bron, at: Date.now(), totaal: p.batteryResult, besparing: p.batterySavings, payload: body });
@@ -956,59 +961,164 @@ function bembPage() {
       return rapport.join('\n');
     });
   }
-  var historieStop = false, historieBezig = false;
-  async function historie(vanYm) {
+  /* ── Historie per maand ──
+     Maanden aanvinken en versturen; per dag een regel in de stroom; per maand een status die
+     bewaard blijft (k(id,'hist:'+ym)):
+       ok      alle complete dagen verwerkt en (afgelopen maand) maandtotaal verstuurd/ongewijzigd
+       lopend  huidige maand: alle complete dagen tot nu verwerkt (maandtotaal pas na afloop)
+       deels   één of meer dagen niet bruikbaar of nog niet complete; maandtotaal niet vervangen
+       fout    Mijnbatterij/BE-fout of gestopt
+       leeg    geen BE-dagen in die maand (vóór de batterij)
+       proef   proefstand: gevalideerd, niets opgeslagen */
+  var historieStop = false, historieBezig = false, histVoortgang = null;
+  function histStroom(regel) {
+    var t = new Date().toLocaleTimeString('nl-NL', { timeZone: TZ, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    histStroomRegels.push(t + '  ' + regel); if (histStroomRegels.length > 500) histStroomRegels.splice(0, histStroomRegels.length - 500);
+    if (shadow) { var el = $('hist-stroom'); if (el) { el.hidden = false; el.textContent = histStroomRegels.join('\n'); el.scrollTop = el.scrollHeight; } }
+  }
+  var histStroomRegels = [];
+  function eur(x) { return '€ ' + (Math.round(x * 100) / 100).toFixed(2).replace('.', ','); }
+  async function verstuurMaand(id, ym, c, vk, rapport) {
+    var res = { ym: ym, at: Date.now(), st: 'fout', dagen: 0, n: 0, verstuurd: 0, ongewijzigd: 0, geweigerd: 0, overgeslagen: 0, nietComplete: 0, totaal: 0, besparing: 0, maand: '', proef: !!c.proef, versie: VERSIE };
+    var j; try { await wacht(BE_PAUZE); j = await maandBron(id, ym, 60000); }
+    catch (e) { res.fout = e.message; histStroom(ym + '  BE-maand niet opgehaald: ' + e.message); if (e.pauze) historieStop = true; return res; }
+    var dagen = (j.series || []).map(function (r) { return r && r.date; }).filter(function (d) { return typeof d === 'string' && d.slice(0, 7) === ym && d < vk; }).sort();
+    res.dagen = dagen.length;
+    if (!dagen.length) { res.st = 'leeg'; histStroom(ym + '  geen BE-dagen in deze maand.'); return res; }
+    // Bestaande records ophalen: ook de historie volgt de afstemmingsregel (niets nauwkeurigers overschrijven).
+    var bestaand = {};
+    try { var ba = await mb('GET', '/api/results/daily?from=' + dagen[0] + '&to=' + dagen[dagen.length - 1]), bj = JSON.parse(ba.text);
+      ((bj && bj.results) || []).forEach(function (x) { if (x && x.date) bestaand[String(x.date).slice(0, 10)] = x; }); }
+    catch (e) { res.fout = 'Mijnbatterij-records niet opgehaald: ' + e.message; histStroom(ym + '  ' + res.fout); return res; }
+    var som = { t: 0, b: 0, l: 0, o: 0, n: 0 }, alles = true, gestopt = false;
+    for (var di = 0; di < dagen.length; di++) {
+      var dk = dagen[di];
+      if (historieStop) { gestopt = true; break; }
+      if (histVoortgang) { histVoortgang.dag = di + 1; histVoortgang.dagen = dagen.length; toonVoortgang(); }
+      var rij = rijVan(j, dk);
+      if (!rij || rij.status !== 'complete') {
+        // BE maakt een dag pas na ~48 uur definitief: de laatste dagen zijn nog niet klaar (verwacht).
+        if (dk >= plusDagen(vk, -3)) { res.wachtOpBE = (res.wachtOpBE || 0) + 1; histStroom(dk + '  nog niet definitief bij BE (volgt vanzelf)'); }
+        else { alles = false; res.nietComplete++; histStroom(dk + '  niet complete bij BE — overgeslagen'); }
+        continue;
+      }
+      try {
+        var r = await dagDefinitief(id, dk, rij, c, false), u = {};
+        await verstuurDag(id, r, c, rapport, bestaand[dk] || null, u);
+        som.t += r.w.totaal; som.b += r.w.besparing; som.l += r.w.geladen; som.o += r.w.ontladen; som.n++;
+        res[u.wat] = (res[u.wat] || 0) + 1;
+        histStroom(dk + '  ' + eur(r.w.totaal) + '  (besparing ' + eur(r.w.besparing) + ', handel ' + eur(r.w.totaal - r.w.besparing) + ')  ' +
+          r.w.geladen.toFixed(1) + '↑ ' + r.w.ontladen.toFixed(1) + '↓ kWh  kwal ' + Math.round(100 * (r.kwal || 0)) + '%  → ' +
+          (u.wat === 'verstuurd' ? (c.proef ? 'gevalideerd (proef)' : 'verstuurd') : u.wat === 'ongewijzigd' ? 'ongewijzigd' : 'niet vervangen: ' + u.reden));
+      } catch (e) {
+        alles = false; res.overgeslagen++; histStroom(dk + '  overgeslagen: ' + e.message);
+        if (e.pauze) { historieStop = true; gestopt = true; break; }
+      }
+    }
+    res.n = som.n; res.totaal = som.t; res.besparing = som.b;
+    var afgelopen = ym < vk.slice(0, 7);
+    if (gestopt) { res.st = 'fout'; res.fout = 'gestopt'; histStroom(ym + '  gestopt na ' + som.n + '/' + dagen.length + ' dagen.'); return res; }
+    var nogBE = res.wachtOpBE || 0;
+    if (afgelopen && alles && som.n === dagen.length) {
+      var mp = { yearMonth: ym, batteryResult: e2(som.t), batterySavings: e2(som.b), batteryCharged: k3(som.l), batteryDischarged: k3(som.o),
+        partial: som.n < dagenInMaand(ym), note: 'Som van ' + som.n + ' BE-definitieve dagen. BE-Mijnbatterij ' + VERSIE + '.' };
+      var mk = k(id, 'maand:' + ym), oud = await lees(mk), hash = JSON.stringify(mp);
+      if (c.proef) { res.maand = 'proef'; res.st = 'proef'; }
+      else if (!oud || oud.hash !== hash) {
+        try { await mb('POST', '/api/results/monthly', mp); await schrijf(mk, { hash: hash, at: Date.now() }); res.maand = 'verstuurd'; res.st = 'ok'; }
+        catch (e) { res.maand = 'mislukt'; res.fout = 'maandtotaal: ' + e.message; res.st = 'fout'; }
+      } else { res.maand = 'ongewijzigd'; res.st = 'ok'; }
+      histStroom(ym + '  ' + som.n + '/' + dagen.length + ' dagen · maandtotaal ' + eur(som.t) + ' (besparing ' + eur(som.b) + ') ' +
+        ({ verstuurd: 'verstuurd ✓', ongewijzigd: 'ongewijzigd ✓', proef: '— proefstand, niet verstuurd', mislukt: 'MISLUKT: ' + res.fout })[res.maand]);
+    } else if (alles && som.n + nogBE === dagen.length) {
+      // Lopende maand, of een net afgelopen maand waarvan BE de laatste dagen nog niet definitief heeft.
+      res.st = c.proef ? 'proef' : 'lopend';
+      histStroom(ym + '  ' + som.n + ' dagen verwerkt' + (nogBE ? ', ' + nogBE + ' nog niet definitief bij BE' : '') + ' — maandtotaal volgt als de maand compleet is.');
+    } else {
+      res.st = 'deels';
+      histStroom(ym + '  ' + som.n + '/' + dagen.length + ' dagen verwerkt; maandtotaal niet vervangen' + (res.overgeslagen ? ' (' + res.overgeslagen + ' niet bruikbaar)' : '') + '.');
+    }
+    return res;
+  }
+  async function verstuurMaanden(lijst) {
     var id = klant(), c = cfg(); if (!id) throw Error('Geen installatie bekend');
-    if (!/^\d{4}-\d{2}$/.test(vanYm)) throw Error('Kies een startmaand');
+    lijst = Array.from(new Set(lijst)).filter(function (ym) { return /^\d{4}-\d{2}$/.test(ym); }).sort();
+    if (!lijst.length) throw Error('Vink eerst één of meer maanden aan');
     if (historieBezig) throw Error('Historie loopt al');
     historieBezig = true; historieStop = false; BE_PAUZE = HISTORIE_PAUZE;
-    var rapport = [];
+    var rapport = [], uitslag = [];
+    histStroom('Start: ' + lijst.join(', ') + (c.proef ? ' (proefstand)' : '') + ' — ca. 4 s per dag.');
     try {
       var gestart = false;
       await lock('bemb-dagen', async function () {
         gestart = true;
-        var vk = vandaag(), lijst = maanden(vanYm, vk.slice(0, 7));
-        for (var ym of lijst) {
-          if (historieStop) { rapport.push('Gestopt door gebruiker.'); break; }
-          var j; try { await wacht(BE_PAUZE); j = await maandBron(id, ym, 60000); }
-          catch (e) { rapport.push(ym + ': ' + e.message); if (e.pauze) break; continue; }
-          var dagen = (j.series || []).map(function (r) { return r && r.date; }).filter(function (d) { return typeof d === 'string' && d.slice(0, 7) === ym && d < vk; }).sort();
-          // Bestaande records ophalen: ook de historie volgt de afstemmingsregel (niets nauwkeurigers overschrijven).
-          var bestaand = {};
-          if (dagen.length) {
-            try { var ba = await mb('GET', '/api/results/daily?from=' + dagen[0] + '&to=' + dagen[dagen.length - 1]), bj = JSON.parse(ba.text);
-              ((bj && bj.results) || []).forEach(function (x) { if (x && x.date) bestaand[String(x.date).slice(0, 10)] = x; }); }
-            catch (e) { rapport.push(ym + ': Mijnbatterij-records niet opgehaald (' + e.message + '); maand overgeslagen.'); continue; }
-          }
-          var som = { t: 0, b: 0, l: 0, o: 0, n: 0, alles: true };
-          for (var dk of dagen) {
-            if (historieStop) break;
-            status('Historie ' + ym + ': ' + dk + ' …');
-            var rij = rijVan(j, dk);
-            if (!rij || rij.status !== 'complete') { som.alles = false; continue; }
-            try {
-              var r = await dagDefinitief(id, dk, rij, c, false);
-              await verstuurDag(id, r, c, rapport, bestaand[dk] || null);
-              som.t += r.w.totaal; som.b += r.w.besparing; som.l += r.w.geladen; som.o += r.w.ontladen; som.n++;
-            } catch (e) { som.alles = false; rapport.push(dk + ': ' + e.message); if (e.pauze) { historieStop = true; break; } }
-          }
-          // Maandtotaal alleen voor afgelopen, volledig berekende maanden.
-          if (ym < vk.slice(0, 7) && som.alles && som.n && som.n === dagen.length) {
-            var mp = { yearMonth: ym, batteryResult: e2(som.t), batterySavings: e2(som.b), batteryCharged: k3(som.l), batteryDischarged: k3(som.o),
-              partial: som.n < dagenInMaand(ym), note: 'Som van ' + som.n + ' BE-definitieve dagen. BE-Mijnbatterij ' + VERSIE + '.' };
-            var mk = k(id, 'maand:' + ym), oud = await lees(mk), hash = JSON.stringify(mp);
-            if (c.proef) rapport.push(ym + ': maandtotaal € ' + mp.batteryResult + ' (besparing € ' + mp.batterySavings + ') — proefstand, niet verstuurd (maand-API kent geen testvlag).');
-            else if (!oud || oud.hash !== hash) {
-              try { await mb('POST', '/api/results/monthly', mp); await schrijf(mk, { hash: hash, at: Date.now() }); rapport.push(ym + ': maandtotaal verstuurd € ' + mp.batteryResult + '.'); }
-              catch (e) { rapport.push(ym + ': maandtotaal mislukt: ' + e.message); }
-            } else rapport.push(ym + ': maandtotaal ongewijzigd.');
-          } else if (ym < vk.slice(0, 7)) rapport.push(ym + ': ' + som.n + '/' + dagen.length + ' dagen definitief; maandtotaal niet vervangen.');
+        var vk = vandaag();
+        for (var mi = 0; mi < lijst.length; mi++) {
+          if (historieStop) { histStroom('Gestopt door gebruiker.'); break; }
+          var ym = lijst[mi];
+          histVoortgang = { ym: ym, maand: mi + 1, maanden: lijst.length, dag: 0, dagen: 0 }; toonVoortgang();
+          histStatus[ym] = Object.assign({}, histStatus[ym] || {}, { bezig: true }); tekenMaanden();
+          var res = await verstuurMaand(id, ym, c, vk, rapport);
+          histStatus[ym] = res; await schrijf(k(id, 'hist:' + ym), res);
+          if (res.st !== 'fout' || res.fout !== 'gestopt') histSelectie.delete(ym);
+          uitslag.push(ym + ': ' + res.st); tekenMaanden();
         }
       });
-      if (!gestart) rapport.push('Er loopt al een dagronde; probeer het zo opnieuw.');
-    } finally { historieBezig = false; BE_PAUZE = 1250; }
+      if (!gestart) throw Error('Er loopt al een dagronde; probeer het zo opnieuw.');
+    } finally {
+      historieBezig = false; BE_PAUZE = 1250; histVoortgang = null; toonVoortgang();
+      Object.keys(histStatus).forEach(function (ym) { if (histStatus[ym] && histStatus[ym].bezig) delete histStatus[ym].bezig; });
+      tekenMaanden();
+    }
+    histStroom('Klaar: ' + uitslag.join(' · '));
     rapport.forEach(noteer); render();
-    return rapport.join('\n');
+    return uitslag.join(' · ');
+  }
+  // Oude aanroep (vanaf een maand): alle maanden t/m nu.
+  async function historie(vanYm) { return verstuurMaanden(maanden(vanYm, vandaag().slice(0, 7))); }
+  var histStatus = {}, histSelectie = new Set(), histJaar = null;
+  async function laadHistStatus() {
+    var id = klant(); if (!id) return;
+    var nu = vandaag(), j0 = +nu.slice(0, 4) - 4;
+    for (var y = j0; y <= +nu.slice(0, 4); y++) for (var m = 1; m <= 12; m++) {
+      var ym = y + '-' + String(m).padStart(2, '0'); if (ym > nu.slice(0, 7)) break;
+      if (histStatus[ym] && histStatus[ym].bezig) continue;
+      var v = await lees(k(id, 'hist:' + ym)); if (v) histStatus[ym] = v; else delete histStatus[ym];
+    }
+  }
+  var MAAND_KORT = ['jan', 'feb', 'mrt', 'apr', 'mei', 'jun', 'jul', 'aug', 'sep', 'okt', 'nov', 'dec'];
+  var HIST_TEKEN = { ok: '✓', lopend: '✓', deels: '!', fout: '✕', leeg: '–', proef: '○' };
+  var HIST_UITLEG = { ok: 'gelukt', lopend: 'bijgewerkt; maandtotaal volgt als de maand compleet is', deels: 'deels: niet alle dagen bruikbaar', fout: 'mislukt', leeg: 'geen BE-dagen', proef: 'proefstand: gevalideerd, niet opgeslagen' };
+  function tekenMaanden() {
+    if (!shadow || !$('hist-grid')) return;
+    var nu = vandaag().slice(0, 7), jaar = histJaar || +nu.slice(0, 4);
+    $('hist-jaar').textContent = jaar;
+    $('hist-vorig').disabled = jaar <= +nu.slice(0, 4) - 4; $('hist-volgend').disabled = jaar >= +nu.slice(0, 4);
+    var html = '';
+    for (var m = 1; m <= 12; m++) {
+      var ym = jaar + '-' + String(m).padStart(2, '0'), st = histStatus[ym] || null, toekomst = ym > nu;
+      var cls = 'mnd' + (histSelectie.has(ym) ? ' sel' : '') + (st && st.bezig ? ' bezig' : st ? ' st-' + st.st : '');
+      var titel = toekomst ? 'nog niet' : st && st.bezig ? 'bezig…' : st ? HIST_UITLEG[st.st] + ' · ' + new Date(st.at).toLocaleString('nl-NL', { timeZone: TZ, day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) +
+        (st.n ? ' · ' + st.n + '/' + st.dagen + ' dagen · ' + eur(st.totaal) : '') + (st.fout ? ' · ' + st.fout : '') : 'nog niet verstuurd';
+      html += '<button type="button" class="' + cls + '" data-ym="' + ym + '"' + (toekomst || historieBezig ? ' disabled' : '') + ' aria-pressed="' + histSelectie.has(ym) + '" title="' + titel.replace(/"/g, '&quot;') + '">' +
+        '<span class="vink" aria-hidden="true"></span><span class="naam">' + MAAND_KORT[m - 1] + '</span>' +
+        '<span class="teken" aria-label="' + (st && !st.bezig ? HIST_UITLEG[st.st] : '') + '">' + (st && st.bezig ? '…' : st ? HIST_TEKEN[st.st] || '' : '') + '</span>' +
+        (st && !st.bezig && st.n ? '<small>' + eur(st.totaal) + '</small>' : '<small>&nbsp;</small>') + '</button>';
+    }
+    $('hist-grid').innerHTML = html;
+    var n = histSelectie.size;
+    $('hist-go').textContent = n ? 'Verstuur ' + n + (n === 1 ? ' maand' : ' maanden') : 'Verstuur';
+    $('hist-go').disabled = !n || historieBezig; $('hist-stop').hidden = !historieBezig;
+    $('hist-alles').disabled = $('hist-niets').disabled = historieBezig;
+  }
+  function toonVoortgang() {
+    if (!shadow || !$('hist-voortgang')) return;
+    var v = histVoortgang, bar = $('hist-balk');
+    $('hist-voortgang').hidden = !v;
+    if (!v) return;
+    var frac = ((v.maand - 1) + (v.dagen ? v.dag / v.dagen : 0)) / v.maanden;
+    bar.style.width = Math.round(100 * frac) + '%';
+    $('hist-voortgang-tekst').textContent = 'Maand ' + v.maand + '/' + v.maanden + ' (' + v.ym + ')' + (v.dagen ? ' · dag ' + v.dag + '/' + v.dagen : '');
   }
 
   /* ── Planner ── */
@@ -1071,6 +1181,14 @@ function bembPage() {
       '.track{flex:none;position:relative;width:44px;height:24px;border-radius:12px;background:var(--line);transition:background .2s;margin-top:2px}.track span{position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 3px #0003;transition:transform .2s}' +
       '.switch input:checked+.track{background:var(--button)}.switch input:checked+.track span{transform:translateX(20px)}.switch input:focus-visible+.track{outline:2px solid var(--purple);outline-offset:2px}' +
       '.notice{font-size:12px;color:var(--muted);margin-top:10px;min-height:18px}pre{white-space:pre-wrap;font:11px/1.55 ui-monospace,Menlo,monospace;background:var(--soft);border-radius:8px;padding:10px;max-height:260px;overflow:auto;margin:10px 0 0}' +
+      '.hist-kop strong{min-width:44px;text-align:center;font-size:15px}.hist-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px;margin-top:10px}' +
+      '.mnd{position:relative;display:flex;flex-direction:column;align-items:flex-start;gap:2px;padding:9px 10px;text-align:left;min-height:64px}.mnd .naam{font-weight:600}.mnd small{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}' +
+      '.mnd .vink{position:absolute;right:8px;bottom:8px;width:16px;height:16px;border:1.5px solid var(--line);border-radius:4px}.mnd.sel{border-color:var(--purple);background:var(--soft)}.mnd.sel .vink{background:var(--button);border-color:var(--button)}' +
+      '.mnd.sel .vink::after{content:"";position:absolute;left:4px;top:1px;width:4px;height:8px;border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg)}' +
+      '.mnd .teken{position:absolute;right:9px;top:7px;font-weight:700}.st-ok .teken,.st-lopend .teken{color:var(--green)}.st-ok{border-color:var(--green)}.st-lopend{border:1px dashed var(--green)}.st-lopend .teken{opacity:.55}.st-deels .teken{color:#c98a12}.st-fout .teken{color:var(--red)}.st-leeg .teken,.st-proef .teken{color:var(--muted)}' +
+      '.mnd.bezig{border-color:var(--purple);animation:bembpuls 1.2s ease-in-out infinite}@keyframes bembpuls{50%{background:var(--soft)}}' +
+      '.balk{height:6px;border-radius:3px;background:var(--soft);overflow:hidden;margin-bottom:4px}.balk span{display:block;height:100%;width:0;background:var(--button);transition:width .3s}' +
+      '#hist-stroom{max-height:320px}@media(max-width:767px){.hist-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}' +
       'details summary{cursor:pointer;font-weight:600}.uitleg p{font-size:13px;margin-top:8px}.mobile-menu{display:none}' +
       '@media(max-width:767px){.page{padding:12px 10px 28px}.tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.tile strong{font-size:18px}.panel{padding:12px}button,input[type=month],input[type=password]{min-height:44px;font-size:16px}h1{font-size:20px}}' +
       '</style><div class="page"><div class="wrap">' +
@@ -1081,6 +1199,14 @@ function bembPage() {
       '<section class="panel"><h2>Afgelopen dagen</h2><div class="table-wrap"><table><thead><tr><th>Datum</th><th>Bron</th><th>Dekking</th><th>Handel</th><th>Besparing</th><th>Totaal</th><th>Geladen</th><th>Ontladen</th><th>Verstuurd</th><th>Op Mijnbatterij</th></tr></thead><tbody id="dagen"></tbody></table></div>' +
       '<div class="actions">' + knop('Vergelijk met Mijnbatterij', 'id="vergelijk"') + '<span class="notice" id="vergelijk-info" style="margin:0;align-self:center">Klik op een dag voor de exacte payload en wat Mijnbatterij opsloeg.</span></div><pre id="maand-mb" style="margin-top:8px"></pre>' +
       '<p class="notice">Tot BE een dag als complete markeert (ca. 48 uur) komt de dag uit de metingen in deze browser: de eigen cache plus, alleen-lezend, de coulombtelling en het netarchief van Balansenergie All-in. Een voorlopige dag gaat pas mee bij minstens 99% dekking. Daarna wordt hij met de BE-kwartierdata opnieuw berekend en overschreven.</p></section>' +
+      '<section class="panel"><h2>Historie per maand</h2>' +
+      '<div class="row hist-kop">' + knop('‹', 'id="hist-vorig" aria-label="Vorig jaar"') + '<strong id="hist-jaar"></strong>' + knop('›', 'id="hist-volgend" aria-label="Volgend jaar"') +
+      '<span style="flex:1"></span>' + knop('Alles dit jaar', 'id="hist-alles"') + knop('Niets', 'id="hist-niets"') + '</div>' +
+      '<div class="hist-grid" id="hist-grid" role="group" aria-label="Maanden"></div>' +
+      '<div class="row" style="margin-top:12px">' + knop('Verstuur', 'id="hist-go" class="primary"') + knop('Stoppen', 'id="hist-stop" hidden') + '</div>' +
+      '<div id="hist-voortgang" hidden style="margin-top:10px"><div class="balk"><span id="hist-balk"></span></div><small id="hist-voortgang-tekst"></small></div>' +
+      '<pre id="hist-stroom" hidden aria-live="polite"></pre>' +
+      '<p class="notice">Vink maanden aan en verstuur ze: per dag zie je hieronder wat er gebeurt. ✓ met groene rand = gelukt (maandtotaal staat op Mijnbatterij), ✓ met stippelrand = bijgewerkt, maandtotaal volgt als de maand compleet is, ! = niet alle dagen bruikbaar (maandtotaal niet vervangen), ✕ = mislukt of gestopt, – = geen BE-dagen. De status blijft bewaard. Ca. 4 s per dag, om binnen de verzoeklimiet van BE te blijven; dagen die nauwkeuriger op Mijnbatterij staan worden niet overschreven. Maandtotalen (ook handmatig ingevulde) worden alleen vervangen als alle dagen van de maand berekend konden worden.</p></section>' +
       '<section class="panel"><h2>Instellingen</h2>' +
       '<div class="row"><input id="key" type="password" autocomplete="off" placeholder="Mijnbatterij API-sleutel (profielpagina)">' + knop('Opslaan', 'id="key-save"') + knop('Controleren', 'id="key-test"') + knop('Wissen', 'id="key-wis"') + '</div>' +
       '<p class="notice" id="key-state"></p>' +
@@ -1089,9 +1215,7 @@ function bembPage() {
       schakel('c-saldeert', 'EB op teruglevering (t/m 2026)', 'Terugleverprijs inclusief energiebelasting zolang salderen geldt. Vanaf 2027 altijd zonder.') +
       schakel('c-afrr', 'aFRR-vergoedingen meetellen als handel', 'balance_energie_eur + deal_customer_share_eur uit de BE-dagbron; alleen bij definitieve dagen bekend.') +
       '<div class="row" style="margin-top:14px"><label class="muted" for="c-afstemming" style="font-size:12px">Afstemming met Home Assistant</label><select id="c-afstemming" style="border:1px solid var(--line);border-radius:7px;background:var(--paper);padding:8px 10px;min-height:38px"><option value="auto">Automatisch: HA verstuurt als die actief is</option><option value="altijd">Altijd zelf versturen</option></select></div>' +
-      '<p class="notice" id="ha-state"></p>' +
-      '<div class="row" style="margin-top:14px"><label class="muted" for="hist-van" style="font-size:12px">Historie herstellen vanaf</label><input id="hist-van" type="month">' + knop('Herstellen', 'id="hist"') + knop('Stoppen', 'id="hist-stop" hidden') + '</div>' +
-      '<p class="notice">Haalt alle BE-complete dagen vanaf die maand op (ca. 4 s per dag, om binnen de verzoeklimiet van BE te blijven), stuurt gewijzigde dagresultaten en vervangt maandtotalen van volledig berekende afgelopen maanden.</p></section>' +
+      '<p class="notice" id="ha-state"></p></section>' +
       '<details class="panel uitleg"><summary>Rekenregels</summary>' +
       '<p>Per meetsegment krijgt het huis eerst de zonnestroom. Laadt de accu, dan eerst uit het zonne-overschot (gewaardeerd tegen de terugleverprijs die je misloopt) en de rest uit het net (afnameprijs). Ontladen dekt eerst het huis (vermeden afnameprijs), de rest gaat naar het net (terugleverprijs).</p>' +
       '<p>Besparing = ontladen naar huis × afnameprijs − het deel van de laadkosten dat bij die kWh hoort. Handel = ontladen naar net × terugleverprijs − het overige deel van de laadkosten, plus aFRR-vergoedingen. batteryResult = handel + besparing; Mijnbatterij leidt handel daaruit af.</p>' +
@@ -1128,9 +1252,6 @@ function bembPage() {
     };
     $('c-afstemming').value = c.afstemming || 'auto';
     $('c-afstemming').onchange = function () { zetCfg('afstemming', $('c-afstemming').value); render(); };
-    $('hist-van').value = c.historieVan || plusDagen(vandaag(), -90).slice(0, 7);
-    $('hist-van').max = vandaag().slice(0, 7);
-    $('hist-van').onchange = function () { zetCfg('historieVan', $('hist-van').value); };
     $('key-save').onclick = async function () {
       try { var a = await brug({ op: 'key-set', value: $('key').value }); if (!a.ok) throw Error(a.error); $('key').value = ''; heeftSleutel = !!a.hasKey; status(heeftSleutel ? 'Sleutel opgeslagen in de userscript-opslag.' : 'Sleutel gewist.'); render(); }
       catch (e) { status(e.message); }
@@ -1147,12 +1268,24 @@ function bembPage() {
       catch (e) { status(e.message); } finally { b.disabled = false; render(); }
     };
     $('ververs').onclick = async function () { status('Verzamelen…'); await verzamel(); render(); status('Bijgewerkt ' + klok(Date.now()) + '.'); };
-    $('hist').onclick = async function () {
-      $('hist').disabled = true; $('hist-stop').hidden = false;
-      try { status(((await historie($('hist-van').value)) || '').split('\n').slice(-3).join(' · ')); }
-      catch (e) { status(e.message); } finally { $('hist').disabled = false; $('hist-stop').hidden = true; }
+    $('hist-grid').onclick = function (ev) {
+      var b = ev.target.closest && ev.target.closest('button[data-ym]'); if (!b || b.disabled || historieBezig) return;
+      var ym = b.getAttribute('data-ym'); if (histSelectie.has(ym)) histSelectie.delete(ym); else histSelectie.add(ym); tekenMaanden();
+    };
+    $('hist-vorig').onclick = function () { histJaar = (histJaar || +vandaag().slice(0, 4)) - 1; tekenMaanden(); };
+    $('hist-volgend').onclick = function () { histJaar = (histJaar || +vandaag().slice(0, 4)) + 1; tekenMaanden(); };
+    $('hist-alles').onclick = function () {
+      var nu = vandaag().slice(0, 7), jaar = histJaar || +nu.slice(0, 4);
+      for (var m = 1; m <= 12; m++) { var ym = jaar + '-' + String(m).padStart(2, '0'); if (ym <= nu && !(histStatus[ym] && histStatus[ym].st === 'leeg')) histSelectie.add(ym); }
+      tekenMaanden();
+    };
+    $('hist-niets').onclick = function () { histSelectie.clear(); tekenMaanden(); };
+    $('hist-go').onclick = async function () {
+      try { status('Historie: ' + await verstuurMaanden(Array.from(histSelectie))); }
+      catch (e) { status(e.message); tekenMaanden(); }
     };
     $('hist-stop').onclick = function () { historieStop = true; status('Stoppen na de huidige dag…'); };
+    laadHistStatus().then(tekenMaanden);
     $('log').textContent = log.join('\n') || 'Nog geen activiteit.';
   }
   var renderBezig = false;
