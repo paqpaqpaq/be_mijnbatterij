@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4a3378"/><stop offset="1" stop-color="#2a1d47"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <!-- accu -->
+  <rect x="64" y="160" width="344" height="192" rx="40" fill="none" stroke="#ffffff" stroke-width="22"/>
+  <rect x="418" y="214" width="34" height="84" rx="12" fill="#ffffff"/>
+  <!-- inhoud: handel (groen) | besparing (blauw) -->
+  <rect x="92" y="188" width="150" height="136" rx="20" fill="#2fbf8f"/>
+  <rect x="254" y="188" width="126" height="136" rx="20" fill="#3d7bf2"/>
+  <!-- handel: pijlen op en neer -->
+  <g fill="none" stroke="#ffffff" stroke-width="15" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M140 296 V218 M116 242 L140 218 L164 242"/>
+    <path d="M194 216 V294 M170 270 L194 294 L218 270"/>
+  </g>
+  <!-- besparing: huisje -->
+  <g fill="none" stroke="#ffffff" stroke-width="15" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M281 254 L317 222 L353 254"/>
+    <path d="M292 246 V296 H342 V246"/>
+  </g>
+</svg>

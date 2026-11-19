@@ -1,3 +1,5 @@
+<img src="custom_components/be_mijnbatterij/brand/icon.png" width="96" align="right" alt="">
+
 # BE Mijnbatterij (Home Assistant)
 
 Stuurt het accuresultaat van een **Balans Energie**-installatie naar **mijnbatterij.nl**, gesplitst in *handel* en *besparing*. De integratie logt zelf in op het BE-klantdashboard. Daardoor loopt het delen door, ook als niemand het dashboard open heeft.
