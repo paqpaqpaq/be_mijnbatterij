@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BE Mijnbatterij
 // @namespace    paq.balansenergie
-// @version      1.2.3
+// @version      1.2.4
 // @description  Deelt accuresultaten van het Balans Energie-dashboard met mijnbatterij.nl, gesplitst in handel en besparing. Los van Balansenergie All-in; eigen pagina in het menu.
 // @homepageURL  https://github.com/paqpaqpaq/be_mijnbatterij
 // @updateURL    https://raw.githubusercontent.com/paqpaqpaq/be_mijnbatterij/main/userscript/BE-Mijnbatterij.user.js
@@ -77,7 +77,7 @@
         poging++;
         fn({
           method: method, url: API + v.path, timeout: 25000,
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.2.3' },
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.2.4' },
           data: v.body ? JSON.stringify(v.body) : undefined,
           onload: function (r) {
             var ok = r.status >= 200 && r.status < 300, text = String(r.responseText || '');
@@ -103,7 +103,7 @@ function bembPage() {
   if (window.__bembLoaded) return;
   window.__bembLoaded = true;
 
-  var VERSIE = '1.2.3', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
+  var VERSIE = '1.2.4', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
   // Marge (procentpunt): twee verzenders met vrijwel volledige data mogen elkaar vervangen;
   // aanvullen naast HA gebeurt pas bij +1 pp, zodat ze niet pingpongen.
   var TOLERANTIE = 0.5;
@@ -319,7 +319,7 @@ function bembPage() {
       onbekend: function (s) { return w.some(function (x) { return s >= x[0] && s < x[1]; }); } };
   }
 
-  if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger, vulOnbalans: vulOnbalans, tenergyAanvullen: tenergyAanvullen, prijsKeuze: prijsKeuze }; return; }
+  if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger, vulOnbalans: vulOnbalans, tenergyAanvullen: tenergyAanvullen, prijsKeuze: prijsKeuze, zetActief: zetActief }; return; }
 
   /* ── Installatie en instellingen ── */
   function geldig(id) { return !!id && /^[A-Za-z0-9_-]+$/.test(id) && !/^(?:account|results|current-history|current-prices|undefined|null)$/i.test(id); }
@@ -807,6 +807,28 @@ function bembPage() {
     return haStatus;
   }
   function haNeemtOver(c) { return c.afstemming !== 'altijd' && haStatus.actief; }
+  // Hartslag van de browser: verstuurt de plugin (HA kon zijn heartbeat niet kwijt), dan zet hij
+  // elke 10 minuten actief=<tijd> in zijn eigen recentste dagrecord, met dezelfde waarden.
+  // Home Assistant stuurt dan geen live; is de hartslag ouder dan 25 min (dashboard dicht), wel.
+  var laatsteHartslag = 0;
+  function zetActief(note, iso) {
+    return String(note || '').replace(/\[BEMB ([^\]]*)\]/, function (m, inner) { return '[BEMB ' + inner.replace(/\s*actief=\S+/, '') + ' actief=' + iso + ']'; });
+  }
+  async function browserHartslag(id, c) {
+    if (c.proef || Date.now() - laatsteHartslag < 10 * 60000) return;
+    laatsteHartslag = Date.now();
+    var tot = plusDagen(vandaag(), -1), van = plusDagen(vandaag(), -DAG_VENSTER), a = await mb('GET', '/api/results/daily?from=' + van + '&to=' + tot), j;
+    try { j = JSON.parse(a.text); } catch (e) { j = {}; }
+    var recs = ((j && j.results) || []).filter(function (r) { return r && r.date; }).sort(function (x, y) { return x.date < y.date ? 1 : -1; });
+    for (var r of recs) {
+      var lab = leesLabel(r.note);
+      if (!lab || lab.bron !== 'browser') continue;
+      var dk = String(r.date).slice(0, 10), st = await lees(k(id, 'sent:' + dk));
+      if (!st || !st.payload || st.payload.test) continue;
+      await mb('POST', '/api/results/daily', Object.assign({}, st.payload, { note: zetActief(st.payload.note, isoAms(Date.now())) }));
+      return dk;
+    }
+  }
   function dagPayload(r, c) {
     // Meer dan 2 uur met daggemiddelde prijs: geen kwartierwaardering meer, dus als onzeker markeren.
     var w = r.w, invalid = r.bron === 'cache' ? (r.dekking < 0.99 || r.prijsDekking < 0.99 || w.zonderPrijs > 0) : (w.zonderPrijs > 0 || (w.geschattePrijs || 0) > 8);
@@ -852,6 +874,7 @@ function bembPage() {
       if (c.proef) p.test = true;
       await mb('POST', '/api/live', p);
       laatsteLive = { at: Date.now(), p: p };
+      try { await browserHartslag(id, c); } catch (e) { noteer('Hartslag: ' + e.message); }
       noteer('Live ' + (c.proef ? 'gevalideerd (proef)' : 'verstuurd') + ': totaal € ' + p.batteryResult + ', besparing € ' + p.batterySavings + (p.invalid ? ' · onvolledig' : ''));
       render();
     });

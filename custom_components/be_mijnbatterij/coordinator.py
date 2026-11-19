@@ -98,7 +98,7 @@ class BEMBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "dekking": (v or {}).get("dekking"), "zonder_prijs": w.get("zonderPrijs"),
             "soc": (e.s.get("laatste") or {}).get("s") if e else None,
             "laatste_live": e.laatste_live["at"] / 1000 if e and e.laatste_live else None,
-            "status": self.fout or ("proefstand" if e and e.proef else "browserplugin verstuurt" if e and e.versturen and e.hb_mislukt
+            "status": self.fout or ("proefstand" if e and e.proef else "browserplugin verstuurt" if e and e.versturen and e.browser_verstuurt
                                    else "actief" if e and e.versturen else "alleen meten"),
             "log": (e.log[:15] if e else []), "dagen": dagen, "kwartieren": len(top),
             "rendement": e.eta if e else None,

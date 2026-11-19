@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime
 from typing import Any, Awaitable, Callable
 
 from . import calc
@@ -26,6 +27,7 @@ PRIJS_DAGEN = 16
 DEF_DAGEN = 40
 DAG_VENSTER = 10
 HEARTBEAT_S = 15 * 60
+BROWSER_ACTIEF_MS = 25 * 60_000  # browserhartslag (elke 10 min) geldt zo lang
 DAGRONDE_S = 30 * 60
 MAAND_TTL_S = 2 * 3600
 
@@ -62,6 +64,7 @@ class Engine:
         # dan ook live; Home Assistant stuurt dan geen live om elkaar niet te overschrijven.
         self.hb_mislukt = False
         self.hb_poging = 0.0
+        self.browser_hartslag = 0  # ms; laatste actief= van de browserplugin
 
     # ── hulpjes ──────────────────────────────────────────────────────────
     def noteer(self, tekst: str) -> None:
@@ -69,6 +72,12 @@ class Engine:
         self.log.insert(0, f"{stempel}  {tekst}")
         del self.log[60:]
         _LOGGER.debug(tekst)
+
+    @property
+    def browser_verstuurt(self) -> bool:
+        """Kon HA zijn heartbeat niet kwijt en geeft de plugin hartslag (≤ 25 min), dan verstuurt die."""
+        return (self.hb_mislukt and not self.proef
+                and self.now_ms() - self.browser_hartslag <= BROWSER_ACTIEF_MS)
 
     @property
     def saldeert(self) -> bool:
@@ -283,8 +292,8 @@ class Engine:
     async def live(self) -> dict | None:
         m = self.s.get("laatste")
         nu = self.now_ms()
-        if self.hb_mislukt and not self.proef:
-            raise MBError("de browserplugin verstuurt; Home Assistant vond geen dag voor zijn heartbeat")
+        if self.browser_verstuurt:
+            raise MBError("de browserplugin verstuurt (hartslag " + time.strftime("%H:%M", time.localtime(self.browser_hartslag / 1000)) + ")")
         if not m or not calc.getal(m.get("bo")) or nu - m["t"] > 300_000:
             raise MBError("Geen actuele accumeting (jonger dan 5 min); live niet verstuurd")
         r = self.dag_uit_metingen(calc.dag_van(m["t"]), int(m["t"]))
@@ -368,6 +377,14 @@ class Engine:
             vk = calc.vandaag(nu)
             dagen = [calc.plus_dagen(vk, -i) for i in range(1, DAG_VENSTER + 1)]
             bestaand = await self.mb.dagen(dagen[-1], dagen[0])
+            for rec in bestaand.values():
+                lab = calc.lees_label((rec or {}).get("note"))
+                if lab and lab.get("bron") == "browser" and lab.get("actief"):
+                    try:
+                        t = int(datetime.fromisoformat(lab["actief"]).timestamp() * 1000)
+                    except ValueError:
+                        continue
+                    self.browser_hartslag = max(self.browser_hartslag, t)
             for dk in dagen:
                 try:
                     maand_j = await self.maand_bron(dk[:7], MAAND_TTL_S)
@@ -385,7 +402,7 @@ class Engine:
                 self.s["heartbeat_at"] = self.laatste_heartbeat
                 return dk
             if not self.hb_mislukt:
-                self.noteer("Heartbeat: de browserplugin heeft alle recente dagen nauwkeuriger; die verstuurt nu ook live.")
+                self.noteer("Heartbeat: de browserplugin heeft alle recente dagen nauwkeuriger; zolang die hartslag geeft, laat HA live aan de plugin.")
             self.hb_mislukt = True
             self.hb_poging = time.time()
             return None

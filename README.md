@@ -64,7 +64,7 @@ Beide zetten achter de notitie van elk dagrecord een label:
   - *voorlopig* vervangt *voorlopig* alleen bij minstens gelijke meetdekking;
   - *definitief* vervangt *definitief* alleen bij minstens gelijke nauwkeurigheid (`kwal`): het aandeel kwartieren waarvan de verdeling over huis en net uit eigen metingen komt en de prijs echt bekend is (niet het daggemiddelde). Zonder eigen metingen van een dag moet een verzender de BE-kwartieren schatten, en dat is minder nauwkeurig;
   - zo vult de bron met de meeste meetdata een dag in.
-- **Eén live-verzender:** kan Home Assistant zijn heartbeat nergens kwijt (de plugin heeft alle recente dagen nauwkeuriger, bijvoorbeeld vlak na de installatie), dan stuurt hij ook geen live; de status toont dan "browserplugin verstuurt". Zodra HA zelf volledige dagen heeft, neemt hij het over.
+- **Eén live-verzender:** kan Home Assistant zijn heartbeat nergens kwijt (de plugin heeft alle recente dagen nauwkeuriger, bijvoorbeeld vlak na de installatie), dan verstuurt de plugin. Die zet dan elke 10 minuten zelf `actief=<tijd>` in zijn recentste dagrecord, met dezelfde waarden. Zolang die hartslag hooguit 25 minuten oud is, stuurt HA geen live; de status toont dan "browserplugin verstuurt". Sluit je het dashboard, dan neemt HA het binnen 25 minuten over. Zodra HA zelf volledige dagen heeft, wordt HA weer de vaste verzender.
 - **Proefstand:** in proefstand stuurt Home Assistant geen heartbeat, dus neemt de plugin niets over.
 - **Plugin-override:** in de plugin kun je *Altijd zelf versturen* kiezen.
 
