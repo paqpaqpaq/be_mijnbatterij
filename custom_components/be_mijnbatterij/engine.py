@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import Any, Awaitable, Callable
 
 from . import calc
-from .api import TenergyClient, BEClient, BEError, BERateLimited, MBClient, MBError
+from .api import TenergyClient, TennetClient, BEClient, BEError, BERateLimited, MBClient, MBError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,15 +40,16 @@ def _nu_ms() -> int:
 class Engine:
     def __init__(self, be: BEClient, mb: MBClient, state: dict, opties: dict, versie: str,
                  now_ms: Callable[[], int] = _nu_ms, slaap: Callable[[float], Awaitable[None]] = asyncio.sleep,
-                 tenergy: TenergyClient | None = None) -> None:
+                 tenergy: TenergyClient | None = None, tennet: TennetClient | None = None) -> None:
         self.be, self.mb, self.versie = be, mb, versie
         self.tenergy = tenergy
+        self.tennet = tennet
         self.opties = opties
         self.now_ms = now_ms
         self.slaap = slaap
         self.s = state
         for key, leeg in (("kw", {}), ("prijzen", {}), ("def", {}), ("sent", {}), ("maand", {}), ("hersteld", {}),
-                          ("tenergy", {}), ("tenergy_act", {})):
+                          ("tenergy", {}), ("tenergy_act", {}), ("tennet", {})):
             self.s.setdefault(key, leeg)
         self.s.setdefault("eta_som", calc.kalibratie_leeg())
         self.log: list[str] = []
@@ -135,6 +136,9 @@ class Engine:
                 n["bo"] = r["bo"]
             if calc.getal(r.get("s")):
                 n["s"] = r["s"]
+            for f in ("p", "g", "l"):
+                if calc.getal(r.get(f)):
+                    n[f] = r[f]
             calc.kalibratie_tel(self.s["eta_som"], r)
             if vorige:
                 # Bestaande kwartierwaarden worden aangevuld, niet vervangen.
@@ -225,12 +229,43 @@ class Engine:
         na = calc.prijs_gaten(self.prijs_index(), start, tot)
         self.noteer(f"Prijzen {dk}: {voor - na} kwartieren hersteld" + (f", {na} nog zonder prijs ({n} rijen van BE)" if na else ""))
 
+    # ── TenneT-settlementprijzen (afgelopen dagen) ───────────────────────
+    async def tennet_prijzen(self, dk: str) -> dict[int, dict]:
+        """Vastgestelde tekort-/overschotprijzen per kwartier van een afgelopen dag (TenneT-publicatie)."""
+        nu = self.now_ms()
+        if not self.tennet or dk >= calc.vandaag(nu):
+            return {}
+        st = self.s["tennet"].get(dk)
+        if st and st.get("v") == 1 and (st.get("compleet") or nu / 1000 - st["at"] < (6 if st.get("rows") else 1) * 3600):
+            return {int(q): v for q, v in (st.get("rows") or {}).items()}
+        try:
+            rijen = await self.tennet.dag(dk)
+            rows, compleet = calc.tennet_kwartieren(dk, rijen)
+        except (BEError, calc.BronFout) as err:
+            self.noteer(f"TenneT-prijzen {dk}: {err}")
+            self.s["tennet"][dk] = {"v": 1, "at": nu / 1000, "fout": str(err)}
+            return {}
+        if not rows:
+            self.s["tennet"][dk] = {"v": 1, "at": nu / 1000, "fout": "nog niet gepubliceerd"}
+            return {}
+        self.s["tennet"][dk] = {"v": 1, "at": nu / 1000, "compleet": compleet, "rows": {str(q): v for q, v in rows.items()}}
+        # Opslag klein houden: alleen het venster van de dagelijkse ronde bewaren (historie haalt zelf opnieuw).
+        grens = calc.plus_dagen(calc.vandaag(nu), -14)
+        for oud in [d for d in self.s["tennet"] if d < grens]:
+            del self.s["tennet"][oud]
+        if not compleet:
+            self.noteer(f"TenneT-prijzen {dk}: nog niet alle kwartieren gepubliceerd.")
+        return rows
+
+    async def prijzen_dag(self, dk: str) -> dict[int, dict]:
+        return calc.met_tennet(self.prijs_index(), await self.tennet_prijzen(dk))
+
     # ── berekenen ────────────────────────────────────────────────────────
-    def dag_uit_metingen(self, dk: str, tot: int | None = None) -> dict:
+    def dag_uit_metingen(self, dk: str, tot: int | None = None, prijzen: dict[int, dict] | None = None) -> dict:
         start, eind = calc.grenzen(dk)
         einde = min(eind, tot or eind)
         duur = max(1.0, (einde - start) / 1000)
-        kw = {q: x for q, x in calc.zet_prijzen(self.kw_dag(dk), self.prijs_index()).items() if q < einde}
+        kw = {q: x for q, x in calc.zet_prijzen(self.kw_dag(dk), prijzen if prijzen is not None else self.prijs_index()).items() if q < einde}
         w = calc.waardeer(kw, self.saldeert, None)
         return {"dk": dk, "bron": "cache", "kw": kw, "w": w, "eta": self.eta,
                 "dekking": min(1.0, w["accuSec"] / duur), "prijsDekking": min(1.0, w["prijsSec"] / duur),
@@ -252,7 +287,7 @@ class Engine:
         st = self.s["def"].get(dk)
         nu = self.now_ms()
         recent = nu - calc.grenzen(dk)[1] < 7 * 86_400_000
-        if st and st.get("v") == 2 and st.get("sig") == sig and (st.get("kw") or (st.get("fout") and not force)):
+        if st and st.get("v") == 3 and st.get("sig") == sig and (st.get("kw") or (st.get("fout") and not force)):
             houdbaar = 86_400 if st.get("fout") else (6 * 3600 if recent else 30 * 86_400)
             if nu / 1000 - st["at"] < houdbaar:
                 if st.get("fout"):
@@ -263,23 +298,23 @@ class Engine:
         try:
             kw = calc.parse_definitief(j, rij, dk)
         except calc.BronFout as err:
-            self.s["def"][dk] = {"v": 2, "sig": sig, "at": nu / 1000, "fout": str(err)}
+            self.s["def"][dk] = {"v": 3, "sig": sig, "at": nu / 1000, "fout": str(err)}
             raise
-        self.s["def"][dk] = {"v": 2, "sig": sig, "at": nu / 1000, "kw": {str(q): v for q, v in kw.items()}}
+        self.s["def"][dk] = {"v": 3, "sig": sig, "at": nu / 1000, "kw": {str(q): v for q, v in kw.items()}}
         return kw
 
     async def dag_definitief(self, dk: str, rij: dict, force: bool) -> dict:
         bron = await self.haal_definitief(dk, rij, force)
         d = calc.verdeel_definitief(bron, self.kw_dag(dk), self.eta)
-        if d["ontbrekend"] > 4:
-            raise calc.BronFout(f"{d['ontbrekend']} kwartieren zonder accuwaarden, ook niet in eigen metingen")
-        kw = calc.kies_prijzen(d["kw"], bron, self.prijs_index(), rij)
+        # Kwartieren zonder accuwaarden bij BE (en zonder eigen metingen): parse_definitief heeft al
+        # gecontroleerd dat BE's dagtotaal ze ook niet meetelt; we volgen BE en tellen ze als 0.
+        kw = calc.kies_prijzen(d["kw"], bron, await self.prijzen_dag(dk), rij)
         w = calc.waardeer(kw, self.saldeert, calc.afrr_van(rij) if self.afrr else None)
         start, eind = calc.grenzen(dk)
         duur = (eind - start) / 1000
         return {"dk": dk, "bron": "BE", "kw": kw, "w": w, "eta": self.eta, "dekking": min(1.0, w["accuSec"] / duur),
                 "prijsDekking": min(1.0, w["prijsSec"] / duur), "aangevuld": d["aangevuld"],
-                "kwal": calc.kwaliteit(d, w)}
+                "ontbrekend": d["ontbrekend"], "kwal": calc.kwaliteit(d, w)}
 
     async def bepaal_dag(self, dk: str, maand_j: dict | None, force: bool, rapport: list[str]) -> dict | None:
         rij = next((r for r in (maand_j or {}).get("series", []) if isinstance(r, dict) and r.get("date") == dk), None)
@@ -290,7 +325,7 @@ class Engine:
                 raise
             except (calc.BronFout, BEError) as err:
                 rapport.append(f"{dk}: BE complete maar niet bruikbaar ({err}); metingen gebruikt.")
-        r = self.dag_uit_metingen(dk)
+        r = self.dag_uit_metingen(dk, prijzen=await self.prijzen_dag(dk))
         return r if r["dekking"] >= calc.MIN_DEKKING_VOORLOPIG else None
 
     # ── versturen ────────────────────────────────────────────────────────
@@ -307,6 +342,7 @@ class Engine:
              "batterySavings": calc.e2(w["besparing"]), "chargedToday": calc.k3(w["geladen"]),
              "dischargedToday": calc.k3(w["ontladen"]), "gridImportToday": calc.k3(w["imp"]),
              "gridExportToday": calc.k3(w["exp"]), "invalid": r["dekking"] < 0.99 or w["zonderPrijs"] > 0}
+        calc.extra_velden(w, p)
         if calc.getal(m.get("s")) and 0 <= m["s"] <= 100:
             p["batteryCharge"] = calc.to_fixed(m["s"], 1)
         if self.proef:
