@@ -1,0 +1,99 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Balans Energie → Mijnbatterij",
+        "description": "Balans Energie customer dashboard login and your Mijnbatterij API key (profile page on mijnbatterij.nl). Test mode is on by default: requests are validated, nothing is stored.",
+        "data": {
+          "be_username": "BE username (email)",
+          "be_password": "BE password",
+          "mb_api_key": "Mijnbatterij API key"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Log in again",
+        "data": {
+          "be_username": "BE username (email)",
+          "be_password": "BE password",
+          "mb_api_key": "Mijnbatterij API key"
+        }
+      }
+    },
+    "error": {
+      "be_auth": "Balans Energie login failed: check username and password.",
+      "mb_auth": "Mijnbatterij rejected the API key.",
+      "cannot_connect": "Cannot connect to Balans Energie or Mijnbatterij."
+    },
+    "abort": {
+      "already_configured": "This installation is already configured.",
+      "reauth_successful": "Logged in again."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Settings",
+        "data": {
+          "versturen": "Send to Mijnbatterij",
+          "proef": "Test mode (test: true, store nothing)",
+          "saldeert": "Energy tax on feed-in (until 2026)",
+          "afrr": "Count aFRR fees as trading"
+        },
+        "data_description": {
+          "versturen": "Off: measure and display only.",
+          "proef": "While on, the browser plugin does not hand over to Home Assistant.",
+          "saldeert": "Always off from 2027.",
+          "afrr": "Only known for final BE days."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "totaal": {
+        "name": "Result today"
+      },
+      "handel": {
+        "name": "Trading today"
+      },
+      "besparing": {
+        "name": "Savings today"
+      },
+      "geladen": {
+        "name": "Charged today"
+      },
+      "ontladen": {
+        "name": "Discharged today"
+      },
+      "dekking": {
+        "name": "Measurement coverage today"
+      },
+      "soc": {
+        "name": "Battery SOC"
+      },
+      "laatste_live": {
+        "name": "Last live push"
+      },
+      "status": {
+        "name": "Status"
+      }
+    },
+    "button": {
+      "nu_versturen": {
+        "name": "Send now"
+      }
+    }
+  },
+  "services": {
+    "historie_herstellen": {
+      "name": "Restore history",
+      "description": "Resends all final BE days from a month and replaces totals of complete months.",
+      "fields": {
+        "vanaf": {
+          "name": "From month",
+          "description": "Format YYYY-MM"
+        }
+      }
+    }
+  }
+}

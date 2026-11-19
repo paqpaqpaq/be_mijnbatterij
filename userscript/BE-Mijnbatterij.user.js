@@ -1,0 +1,1092 @@
+// ==UserScript==
+// @name         BE Mijnbatterij
+// @namespace    paq.balansenergie
+// @version      1.1.0
+// @description  Deelt accuresultaten van het Balans Energie-dashboard met mijnbatterij.nl, gesplitst in handel en besparing. Los van Balansenergie All-in; eigen pagina in het menu.
+// @homepageURL  https://github.com/paqpaqpaq/be_mijnbatterij
+// @updateURL    https://raw.githubusercontent.com/paqpaqpaq/be_mijnbatterij/main/userscript/BE-Mijnbatterij.user.js
+// @downloadURL  https://raw.githubusercontent.com/paqpaqpaq/be_mijnbatterij/main/userscript/BE-Mijnbatterij.user.js
+// @supportURL   https://github.com/paqpaqpaq/be_mijnbatterij/issues
+// @match        *://dashboard.balansenergie.nl/*
+// @run-at       document-idle
+// @grant        GM_xmlhttpRequest
+// @grant        GM.xmlHttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM.getValue
+// @grant        GM.setValue
+// @connect      api.mijnbatterij.nl
+// ==/UserScript==
+
+/* ─── Brug naar api.mijnbatterij.nl (userscriptlaag) ─────────────────────
+ * Alleen deze laag heeft GM-rechten. De API-sleutel staat in de
+ * userscript-opslag en komt nooit in de pagina. Pagina en brug praten via
+ * twee JSON-nodes en DOM-events; verzoeken worden in de pagina geserialiseerd.
+ */
+(function () {
+  'use strict';
+  if (document.getElementById('bemb-in')) return;
+  var API = 'https://api.mijnbatterij.nl';
+  var KEY = 'bemb_key';
+  var inNode = document.createElement('script');
+  inNode.type = 'application/json'; inNode.id = 'bemb-in';
+  document.documentElement.appendChild(inNode);
+
+  function gmx() {
+    if (typeof GM_xmlhttpRequest === 'function') return GM_xmlhttpRequest;
+    if (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function') return GM.xmlHttpRequest.bind(GM);
+    return null;
+  }
+  async function getKey() {
+    try { if (typeof GM_getValue === 'function') return String(GM_getValue(KEY, '') || ''); } catch (e) {}
+    try { if (typeof GM !== 'undefined' && GM && GM.getValue) return String((await GM.getValue(KEY, '')) || ''); } catch (e) {}
+    return '';
+  }
+  async function setKey(v) {
+    try { if (typeof GM_setValue === 'function') { GM_setValue(KEY, v); return; } } catch (e) {}
+    if (typeof GM !== 'undefined' && GM && GM.setValue) { await GM.setValue(KEY, v); return; }
+    throw new Error('Geen userscript-opslag beschikbaar');
+  }
+  var GET_OK = /^\/api\/me$|^\/api\/results\/(?:daily|monthly)\?from=\d{4}-\d{2}(?:-\d{2})?&to=\d{4}-\d{2}(?:-\d{2})?$/;
+  var POST_OK = /^\/api\/(?:live|results\/daily|results\/monthly)$/;
+
+  document.addEventListener('bemb-send', async function () {
+    var out = document.getElementById('bemb-out'), v;
+    try { v = JSON.parse(out && out.textContent || '{}'); } catch (e) { return; }
+    // Verzoek direct uit de DOM halen: de sleutel mag daar niet blijven staan.
+    if (out) out.textContent = '';
+    if (!v || !v.id) return;
+    function answer(a) { a.id = v.id; inNode.textContent = JSON.stringify(a); document.dispatchEvent(new Event('bemb-answer')); }
+    try {
+      if (v.op === 'key-status') { answer({ ok: true, hasKey: !!(await getKey()).trim() }); return; }
+      if (v.op === 'key-set') {
+        var nieuw = String(v.value || '').trim();
+        if (nieuw && !/^[\x21-\x7e]{8,512}$/.test(nieuw)) { answer({ ok: false, error: 'Sleutel bevat ongeldige tekens' }); return; }
+        await setKey(nieuw); answer({ ok: true, hasKey: !!nieuw }); return;
+      }
+      if (v.op !== 'api') return;
+      var method = v.method === 'POST' ? 'POST' : 'GET';
+      if (method === 'GET' ? !GET_OK.test(v.path) || v.body : !POST_OK.test(v.path) || !v.body) { answer({ ok: false, error: 'Verzoek niet toegestaan' }); return; }
+      var key = (await getKey()).trim();
+      if (!key) { answer({ ok: false, error: 'Geen API-sleutel ingesteld' }); return; }
+      var fn = gmx();
+      if (!fn) { answer({ ok: false, error: 'GM_xmlhttpRequest ontbreekt' }); return; }
+      fn({
+        method: method, url: API + v.path, timeout: 25000,
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.1.0' },
+        data: v.body ? JSON.stringify(v.body) : undefined,
+        onload: function (r) {
+          var ok = r.status >= 200 && r.status < 300, text = String(r.responseText || '');
+          answer({ ok: ok, status: r.status, text: text.slice(0, 20000), error: ok ? '' : 'HTTP ' + r.status + ' — ' + text.slice(0, 300) });
+        },
+        onerror: function () { answer({ ok: false, error: 'Netwerkfout richting mijnbatterij.nl' }); },
+        ontimeout: function () { answer({ ok: false, error: 'Timeout richting mijnbatterij.nl' }); }
+      });
+    } catch (e) { answer({ ok: false, error: e && e.message || String(e) }); }
+  });
+})();
+
+/* ─── Paginadeel ─────────────────────────────────────────────────────────── */
+function bembPage() {
+  'use strict';
+  if (window.__bembLoaded) return;
+  window.__bembLoaded = true;
+
+  var VERSIE = '1.1.0', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
+  var BTW = 1.21, OPSLAG = 0.02;
+  // Energiebelasting excl. btw, schijf 1. Saldering eindigt op 1-1-2027.
+  var EB_EX = { 2025: 0.10154, 2026: 0.09161, 2027: 0.08802 };
+  var RAUW_DAGEN = 10, PRIJS_DAGEN = 16, DAG_VENSTER = 10;
+  var MIN_DEKKING_VOORLOPIG = 0.5;
+  var MAX_KAAL = 1.5, MIN_KWH = 0.05; // grenzen voor een bruikbare kale kwartierprijs (€/kWh)
+
+  /* ── Tijd ── */
+  var fmtDag = new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' });
+  var fmtParts = new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  var fmtKlok = new Intl.DateTimeFormat('nl-NL', { timeZone: TZ, hour: '2-digit', minute: '2-digit' });
+  var fmtDatum = new Intl.DateTimeFormat('nl-NL', { timeZone: 'UTC', weekday: 'short', day: 'numeric', month: 'short' });
+  function dagVan(t) { return fmtDag.format(new Date(t)); }
+  function vandaag() { return dagVan(Date.now()); }
+  function klok(t) { return fmtKlok.format(new Date(t)); }
+  function plusDagen(dk, n) { var d = new Date(Date.parse(dk + 'T12:00:00Z') + n * 86400000); return d.toISOString().slice(0, 10); }
+  var grensCache = {};
+  function grenzen(dk) {
+    if (grensCache[dk]) return grensCache[dk];
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dk)) return null;
+    var t = Date.parse(dk + 'T00:00:00Z') - 3 * 3600000, limiet = t + 36 * 3600000;
+    while (t < limiet && dagVan(t) !== dk) t += Q;
+    if (t >= limiet) return null;
+    var start = t; while (dagVan(t) === dk) t += Q;
+    return (grensCache[dk] = { start: start, eind: t });
+  }
+  function isoAms(t) {
+    var p = {}; fmtParts.formatToParts(new Date(t)).forEach(function (x) { p[x.type] = x.value; });
+    var off = Math.round((Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - Math.floor(t / 1000) * 1000) / 60000);
+    var a = Math.abs(off);
+    return p.year + '-' + p.month + '-' + p.day + 'T' + p.hour + ':' + p.minute + ':' + p.second + (off < 0 ? '-' : '+') +
+      String(Math.floor(a / 60)).padStart(2, '0') + ':' + String(a % 60).padStart(2, '0');
+  }
+  function maanden(van, tot) { var out = [], y = +van.slice(0, 4), m = +van.slice(5, 7); for (;;) { var k = y + '-' + String(m).padStart(2, '0'); if (k > tot) break; out.push(k); if (++m > 12) { m = 1; y++; } } return out; }
+  function dagenInMaand(ym) { return new Date(Date.UTC(+ym.slice(0, 4), +ym.slice(5, 7), 0)).getUTCDate(); }
+  function getal(n) { return typeof n === 'number' && isFinite(n); }
+  function wacht(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  /* ── Rekenen (los van DOM, testbaar) ── */
+  // Verdeling per meetsegment, zoals Mijnbatterij het voorschrijft:
+  // huisverbruik krijgt zonnestroom voorrang; de accu laadt eerst het
+  // zonne-overschot (tegen terugleverprijs) en daarna uit het net (afnameprijs).
+  // po > 0 is afname, bo > 0 is ontladen. rest = huis − zon (zonder accu).
+  function verdeel(po, bo) {
+    var ont = Math.max(bo, 0), lad = Math.max(-bo, 0), rest = po + bo;
+    var ontHuis = Math.min(ont, Math.max(rest, 0)), ladPV = Math.min(lad, Math.max(-rest, 0));
+    return { ontHuis: ontHuis, ontNet: ont - ontHuis, ladPV: ladPV, ladNet: lad - ladPV };
+  }
+  function gatGrens(r) { return Math.max(120000, Math.min(Math.round((r || 0) * 1.5), 600000)); }
+  // Tijdgewogen integratie naar kwartieren (kWh). Gaten worden nooit opgevuld.
+  function naarKwartieren(rows) {
+    var s = (rows || []).filter(function (r) { return r && getal(r.t) && getal(r.po); }).sort(function (a, b) { return a.t - b.t; });
+    var kw = {};
+    for (var i = 0; i < s.length - 1; i++) {
+      var r = s[i], n = s[i + 1], dt = n.t - r.t;
+      if (dt <= 0 || dt > gatGrens(r.r)) continue;
+      for (var pos = r.t; pos < n.t;) {
+        var q = Math.floor(pos / Q) * Q, stop = Math.min(n.t, q + Q), uur = (stop - pos) / 3600000, sec = (stop - pos) / 1000;
+        var c = kw[q] || (kw[q] = { imp: 0, exp: 0, dek: 0, ontHuis: 0, ontNet: 0, ladNet: 0, ladPV: 0, accuSec: 0 });
+        if (r.po > 0) c.imp += r.po * uur / 1000; else c.exp += -r.po * uur / 1000;
+        c.dek += sec;
+        if (getal(r.bo)) {
+          var v = verdeel(r.po, r.bo);
+          c.ontHuis += v.ontHuis * uur / 1000; c.ontNet += v.ontNet * uur / 1000;
+          c.ladNet += v.ladNet * uur / 1000; c.ladPV += v.ladPV * uur / 1000;
+          c.accuSec += sec;
+        }
+        if (getal(n.s) && n.s >= 0 && n.s <= 100 && stop === n.t) c.soc = n.s;
+        pos = stop;
+      }
+    }
+    return kw;
+  }
+  function allin(kaal, isExport, t, c) {
+    if (!getal(kaal)) return null;
+    var jaar = +dagVan(t).slice(0, 4), ebEx = EB_EX[jaar];
+    if (!getal(ebEx)) return null;
+    var eb = ebEx * BTW;
+    return isExport ? kaal * BTW - OPSLAG + (c.saldeert && jaar < 2027 ? eb : 0) : kaal * BTW + OPSLAG + eb;
+  }
+  // Waardering per dag. Besparing en handel volgen de bestemming van de
+  // ontladen kWh; laadkosten worden naar rato van die kWh verdeeld.
+  function waardeer(kw, c, afrrEur) {
+    var t = { ontHuis: 0, ontNet: 0, ladNet: 0, ladPV: 0, huis: 0, net: 0, kNet: 0, kPV: 0, imp: 0, exp: 0,
+      geladen: 0, ontladen: 0, accuSec: 0, prijsSec: 0, zonderPrijs: 0, voorlopigePrijs: 0, kwartieren: 0 };
+    Object.keys(kw).forEach(function (k) {
+      var x = kw[k], q = +k; t.kwartieren++;
+      t.imp += x.imp || 0; t.exp += x.exp || 0;
+      if (!(x.accuSec > 0)) return;
+      var sec = Math.min(900, x.accuSec); t.accuSec += sec;
+      t.geladen += getal(x.geladen) ? x.geladen : x.ladNet + x.ladPV;
+      t.ontladen += getal(x.ontladen) ? x.ontladen : x.ontHuis + x.ontNet;
+      if (x.ontHuis + x.ontNet + x.ladNet + x.ladPV < 1e-9) { t.prijsSec += sec; return; }
+      var pi = allin(x.pIn, false, q, c), pe = allin(x.pUit, true, q, c);
+      if (((x.ontHuis > 0 || x.ladNet > 0) && !getal(pi)) || ((x.ontNet > 0 || x.ladPV > 0) && !getal(pe))) { t.zonderPrijs++; return; }
+      t.prijsSec += sec; if (x.prijsVoorlopig) t.voorlopigePrijs++;
+      t.ontHuis += x.ontHuis; t.ontNet += x.ontNet; t.ladNet += x.ladNet; t.ladPV += x.ladPV;
+      t.huis += x.ontHuis * (pi || 0); t.net += x.ontNet * (pe || 0);
+      t.kNet += x.ladNet * (pi || 0); t.kPV += x.ladPV * (pe || 0);
+      // Alleen tellen als de geschatte prijs in dit kwartier ook echt nodig is.
+      if ((x.prijsGeschatIn && (x.ontHuis > 0 || x.ladNet > 0)) || (x.prijsGeschatUit && (x.ontNet > 0 || x.ladPV > 0))) t.geschattePrijs = (t.geschattePrijs || 0) + 1;
+      var bijdrage = x.ontHuis * (pi || 0) + x.ontNet * (pe || 0) - x.ladNet * (pi || 0) - x.ladPV * (pe || 0);
+      (t.top = t.top || []).push({ q: q, eur: bijdrage, pIn: pi, pUit: pe, ontHuis: x.ontHuis, ontNet: x.ontNet, ladNet: x.ladNet, ladPV: x.ladPV, bron: x.prijsBron || '' });
+    });
+    if (t.top) t.top = t.top.sort(function (a, b) { return Math.abs(b.eur) - Math.abs(a.eur); }).slice(0, 6);
+    var ontl = t.ontHuis + t.ontNet, kosten = t.kNet + t.kPV;
+    if (ontl > 1e-9) {
+      var aandeel = t.ontHuis / ontl;
+      t.besparing = t.huis - aandeel * kosten;
+      t.handel = t.net - (1 - aandeel) * kosten;
+    } else { t.besparing = -t.kPV; t.handel = -t.kNet; }
+    t.afrr = getal(afrrEur) ? afrrEur : 0;
+    t.handel += t.afrr;
+    t.totaal = t.besparing + t.handel;
+    return t;
+  }
+  // Complete BE-kwartieren: bruto kWh van BE, verdeling uit de eigen cache
+  // als die het kwartier goed dekt, anders uit de netto accubeweging.
+  function verdeelDefinitief(bron, cache) {
+    var uit = {}, uitCache = 0, geschat = 0;
+    Object.keys(bron).forEach(function (q) {
+      var v = bron[q], c = cache && cache[q];
+      var cl = c ? c.ladNet + c.ladPV : 0, co = c ? c.ontHuis + c.ontNet : 0;
+      var n = { imp: v.imp, exp: v.exp, accuSec: 900, geladen: v.laden, ontladen: v.ontladen, soc: c && c.soc };
+      if (c && c.accuSec >= 810 && (cl > 0 || v.laden === 0) && (co > 0 || v.ontladen === 0)) {
+        n.ladPV = cl ? v.laden * c.ladPV / cl : 0; n.ladNet = v.laden - n.ladPV;
+        n.ontHuis = co ? v.ontladen * c.ontHuis / co : 0; n.ontNet = v.ontladen - n.ontHuis; uitCache++;
+      } else {
+        var netto = v.ontladen - v.laden; if (Math.abs(netto) < 1e-9) netto = 0;
+        var ont = Math.max(netto, 0), lad = Math.max(-netto, 0), rest = v.imp - v.exp + netto;
+        n.ladPV = Math.min(lad, Math.max(-rest, 0)); n.ladNet = lad - n.ladPV;
+        n.ontHuis = Math.min(ont, Math.max(rest, 0)); n.ontNet = ont - n.ontHuis; geschat++;
+      }
+      uit[q] = n;
+    });
+    return { kw: uit, uitCache: uitCache, geschat: geschat };
+  }
+  function prijsKeuze(p, ctx, events, disc) {
+    var state = ctx.authoritative ? (ctx.planned.has(p.start) ? 'planned' : ctx.onbekend(p.start) ? 'unavailable' : 'none')
+      : ['planned', 'unavailable', 'none'].indexOf(p.dayAheadState) >= 0 ? p.dayAheadState
+      : Object.keys(p.values || {}).some(function (k) { return k.indexOf('day_ahead_') === 0; }) ? 'unavailable' : 'none';
+    var dirs = disc[p.start] || p.directions, vlag = !!p.afrr || events.has(p.start);
+    var ai = Array.isArray(dirs) ? dirs.indexOf('import') >= 0 : vlag, ae = Array.isArray(dirs) ? dirs.indexOf('export') >= 0 : vlag;
+    var mi = state === 'unavailable' ? null : state === 'planned' ? (ai ? 'day_ahead_afrr_import' : 'day_ahead_import') : (ai ? 'afrr_import' : 'onbalans_import');
+    var me = ae ? 'afrr_export' : 'onbalans_export', v = p.values || {};
+    return { mi: mi, me: me, ki: mi && getal(v[mi]) ? v[mi] : null, ke: getal(v[me]) ? v[me] : null };
+  }
+  function planning(j) {
+    var plans = j && j.dayAheadPlans, windows = j && j.dayAheadUnavailableWindows, planned = new Set();
+    (Array.isArray(plans) ? plans : []).forEach(function (p) { if (p && getal(p.start) && p.direction === 'import') planned.add(p.start); });
+    var w = (Array.isArray(windows) ? windows : []).filter(function (x) { return Array.isArray(x) && getal(x[0]) && getal(x[1]) && x[1] > x[0]; });
+    return { authoritative: Array.isArray(plans) || Array.isArray(windows), planned: planned,
+      onbekend: function (s) { return w.some(function (x) { return s >= x[0] && s < x[1]; }); } };
+  }
+
+  if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven }; return; }
+
+  /* ── Installatie en instellingen ── */
+  function geldig(id) { return !!id && /^[A-Za-z0-9_-]+$/.test(id) && !/^(?:account|results|current-history|current-prices|undefined|null)$/i.test(id); }
+  function klant() {
+    var m = location.pathname.match(/^\/customer\/([^/]+)(?:\/|$)/);
+    if (m && geldig(m[1])) return m[1];
+    try { var id = localStorage.getItem('be_laatste_installatie'); if (geldig(id)) return id; } catch (e) {}
+    var links = document.querySelectorAll('a[href*="/customer/"]');
+    for (var i = 0; i < links.length; i++) { var mm = links[i].pathname.match(/^\/customer\/([^/]+)\/(?:results|account)(?:\/|$)/); if (mm && geldig(mm[1])) return mm[1]; }
+    return '';
+  }
+  var CFG = 'bemb_cfg_v1';
+  function cfg() {
+    var d = { auto: false, proef: true, saldeert: true, afrr: true, historieVan: '', afstemming: 'auto' };
+    try { Object.assign(d, JSON.parse(localStorage.getItem(CFG) || '{}')); } catch (e) {}
+    return d;
+  }
+  function zetCfg(k, v) { var c = cfg(); c[k] = v; try { localStorage.setItem(CFG, JSON.stringify(c)); } catch (e) {} }
+
+  /* ── Opslag (eigen IndexedDB, los van All-in) ── */
+  var dbP = null;
+  function db() {
+    if (!dbP) dbP = new Promise(function (res, rej) {
+      var r = indexedDB.open('be-mijnbatterij', 1);
+      r.onupgradeneeded = function () { r.result.createObjectStore('kv'); };
+      r.onsuccess = function () { res(r.result); }; r.onerror = function () { rej(r.error); };
+    });
+    return dbP;
+  }
+  async function lees(k) { var d = await db(); return new Promise(function (res, rej) { var q = d.transaction('kv', 'readonly').objectStore('kv').get(k); q.onsuccess = function () { res(q.result); }; q.onerror = function () { rej(q.error); }; }); }
+  async function schrijf(k, v) { var d = await db(); return new Promise(function (res, rej) { var tx = d.transaction('kv', 'readwrite'); if (v === undefined) tx.objectStore('kv').delete(k); else tx.objectStore('kv').put(v, k); tx.oncomplete = function () { res(); }; tx.onerror = tx.onabort = function () { rej(tx.error || Error('Opslaan mislukt')); }; }); }
+  function k(id, s) { return id + ':' + s; }
+
+  /* ── Logboek ── */
+  var log = [];
+  function noteer(s) { log.unshift(klok(Date.now()) + '  ' + s); log = log.slice(0, 60); var n = shadow && shadow.getElementById('log'); if (n) n.textContent = log.join('\n'); }
+
+  /* ── BE-verzoeken (eigen XHR; deelt de 429-pauze met All-in) ── */
+  function beGet(path, params) {
+    return new Promise(function (resolve, reject) {
+      var until = Number(localStorage.getItem('be_api_retry_until') || 0);
+      if (Date.now() < until) { var p = Error('BE-verzoeklimiet actief tot ' + klok(until)); p.pauze = true; reject(p); return; }
+      var u = new URL(path, location.origin);
+      Object.keys(params || {}).forEach(function (x) { u.searchParams.set(x, params[x]); });
+      var x = new XMLHttpRequest();
+      x.open('GET', u.href); x.withCredentials = true; x.timeout = 30000; x.setRequestHeader('Accept', 'application/json');
+      x.onload = function () {
+        if (x.status === 429) {
+          var ra = x.getResponseHeader('Retry-After'), s = Number(ra), d = ra ? (isFinite(s) ? s * 1000 : Date.parse(ra) - Date.now()) : 60000;
+          if (!isFinite(d) || d < 1000) d = 60000;
+          try { localStorage.setItem('be_api_retry_until', String(Date.now() + d)); } catch (e) {}
+          var e = Error('BE beperkt verzoeken (HTTP 429)'); e.pauze = true; reject(e); return;
+        }
+        if (x.status < 200 || x.status >= 300) { reject(Error('BE HTTP ' + x.status)); return; }
+        try { resolve(JSON.parse(x.responseText)); } catch (e) { reject(Error('BE gaf geen JSON')); }
+      };
+      x.onerror = function () { reject(Error('Netwerkfout naar BE')); };
+      x.ontimeout = function () { reject(Error('Timeout naar BE')); };
+      x.send();
+    });
+  }
+
+  /* ── Brug-aanroepen ── */
+  var brugRij = Promise.resolve();
+  function brug(msg) {
+    function run() {
+      return new Promise(function (resolve, reject) {
+        var id = 'b' + Date.now() + Math.random().toString(36).slice(2);
+        var out = document.getElementById('bemb-out');
+        if (!out) { out = document.createElement('script'); out.type = 'application/json'; out.id = 'bemb-out'; document.documentElement.appendChild(out); }
+        var timer = setTimeout(function () { klaar(); reject(Error('Geen antwoord van de userscriptlaag')); }, 35000);
+        function klaar() { clearTimeout(timer); document.removeEventListener('bemb-answer', ant); }
+        function ant() { var a; try { a = JSON.parse(document.getElementById('bemb-in').textContent); } catch (e) { return; } if (a.id !== id) return; klaar(); resolve(a); }
+        document.addEventListener('bemb-answer', ant);
+        out.textContent = JSON.stringify(Object.assign({ id: id }, msg));
+        document.dispatchEvent(new Event('bemb-send'));
+      });
+    }
+    var p = brugRij.then(run, run); brugRij = p.catch(function () {}); return p;
+  }
+  async function mb(method, path, body) { var a = await brug({ op: 'api', method: method, path: path, body: body || null }); if (!a.ok) throw Error(a.error || 'HTTP ' + a.status); return a; }
+  var mbOpgeslagen = {}, mbMaanden = {}, mbOpgehaald = 0;
+  async function vergelijkMijnbatterij() {
+    var tot = plusDagen(vandaag(), -1), van = plusDagen(vandaag(), -DAG_VENSTER);
+    var a = await mb('GET', '/api/results/daily?from=' + van + '&to=' + tot), j;
+    try { j = JSON.parse(a.text); } catch (e) { throw Error('Mijnbatterij gaf geen JSON'); }
+    var lijst = Array.isArray(j) ? j : (j && (j.results || j.data || j.days)) || [];
+    if (!Array.isArray(lijst)) throw Error('Onbekend antwoord van Mijnbatterij');
+    mbOpgeslagen = {};
+    lijst.forEach(function (r) { var d = r && String(r.date || r.day || '').slice(0, 10); if (/^\d{4}-\d{2}-\d{2}$/.test(d)) mbOpgeslagen[d] = r; });
+    mbMaanden = {};
+    for (var ym of Array.from(new Set([van.slice(0, 7), tot.slice(0, 7)]))) {
+      var b = await mb('GET', '/api/results/monthly?from=' + ym + '&to=' + ym), mj;
+      try { mj = JSON.parse(b.text); } catch (e) { continue; }
+      ((mj && mj.results) || []).forEach(function (r) { var key = String(r.yearMonth || r.date || '').slice(0, 7); if (key === ym) mbMaanden[ym] = r; });
+    }
+    mbOpgehaald = Date.now();
+    return Object.keys(mbOpgeslagen).length;
+  }
+  function num(v) { var n = typeof v === 'string' ? Number(v) : v; return getal(n) ? n : null; }
+  var heeftSleutel = false;
+  async function sleutelStatus() { try { heeftSleutel = !!(await brug({ op: 'key-status' })).hasKey; } catch (e) { heeftSleutel = false; } return heeftSleutel; }
+
+  /* ── Verzamelen: ruwe metingen (26 uur) en prijzen ── */
+  async function verzamelRauw(id) {
+    var nu = Date.now(), lk = 'bemb_rauw_tot:' + id, laatst = Number(localStorage.getItem(lk) || 0);
+    var van = Math.max(nu - 26 * 3600000, laatst ? laatst - 20 * 60000 : 0);
+    var j = await beGet('/customer/current-history/api/', { installation: id, start: String(van), end: String(nu) });
+    var res = j && getal(j.resolutionMs) ? j.resolutionMs : 0, perDag = {}, max = laatst;
+    ((j && j.rows) || []).forEach(function (r) {
+      if (!r || !getal(r.t) || !getal(r.po) || r.t < van - 60000 || r.t > nu + 60000) return;
+      var n = { t: r.t, po: r.po, r: res };
+      if (getal(r.bo)) n.bo = r.bo;
+      if (getal(r.s)) n.s = r.s;
+      (perDag[dagVan(r.t)] = perDag[dagVan(r.t)] || []).push(n);
+      if (r.t > max) max = r.t;
+    });
+    var index = (await lees(k(id, 'rauw-index'))) || { dagen: [] };
+    for (var dk of Object.keys(perDag)) {
+      var oud = ((await lees(k(id, 'rauw:' + dk))) || {}).rows || [], map = new Map(oud.map(function (r) { return [r.t, r]; }));
+      // Fijnere resolutie wint; een grove meting overschrijft nooit een fijne.
+      perDag[dk].forEach(function (r) {
+        var o = map.get(r.t);
+        if (!o) { map.set(r.t, r); return; }
+        if (getal(o.bo) && !getal(r.bo)) return;
+        if (getal(o.bo) && getal(o.r) && o.r < r.r) return;
+        map.set(r.t, r);
+      });
+      await schrijf(k(id, 'rauw:' + dk), { rows: Array.from(map.values()).sort(function (a, b) { return a.t - b.t; }) });
+      if (index.dagen.indexOf(dk) < 0) index.dagen.push(dk);
+    }
+    var grens = plusDagen(vandaag(), -RAUW_DAGEN);
+    for (var d of index.dagen.filter(function (x) { return x < grens; })) await schrijf(k(id, 'rauw:' + d), undefined);
+    index.dagen = index.dagen.filter(function (x) { return x >= grens; }).sort();
+    await schrijf(k(id, 'rauw-index'), index);
+    if (max > laatst) try { localStorage.setItem(lk, String(max)); } catch (e) {}
+  }
+  async function verzamelPrijzen(id) {
+    await verwerkPrijzen(id, await beGet('/customer/current-prices/api/'));
+    // Herstel: gaten van gisteren en vandaag gericht ophalen, hooguit eens per uur per dag.
+    for (var dk of [plusDagen(vandaag(), -1), vandaag()]) { try { await herstelPrijzenDag(id, dk, 3600000); } catch (e) { if (e.pauze) throw e; noteer('Prijzen ' + dk + ': ' + e.message); } }
+  }
+  function prijsGaten(arch, g, tot) {
+    var mist = 0;
+    for (var q = g.start; q < tot; q += Q) if (!arch[q] || (!getal(arch[q].ki) && arch[q].mi) || !getal(arch[q].ke)) mist++;
+    return mist;
+  }
+  // Kwartierprijzen van een dag gericht bij BE ophalen (start/end). De pauze
+  // geldt pas na een geslaagde aanvraag, zodat een mislukte poging terugkomt.
+  async function herstelPrijzenDag(id, dk, pauze) {
+    var g = grenzen(dk), nu = Date.now(), tot = Math.min(g.eind, Math.floor(nu / Q) * Q), hk = 'bemb_prijsherstel:' + id + ':' + dk;
+    if (tot <= g.start) return 0;
+    var arch = ((await lees(k(id, 'prijzen'))) || {}).rows || {}, voor = prijsGaten(arch, g, tot);
+    if (!voor || nu - Number(localStorage.getItem(hk) || 0) < pauze) return voor;
+    await wacht(800);
+    var j;
+    try { j = await beGet('/customer/current-prices/api/', { start: String(g.start), end: String(tot) }); }
+    catch (e) {
+      // BE weigert sommige periodes (HTTP 400): dan vandaag niet steeds opnieuw.
+      if (/HTTP 400/.test(e.message)) try { localStorage.setItem(hk, String(Date.now() + 20 * 3600000)); } catch (x) {}
+      throw e;
+    }
+    await verwerkPrijzen(id, j);
+    try { localStorage.setItem(hk, String(Date.now())); } catch (e) {}
+    var na = prijsGaten(((await lees(k(id, 'prijzen'))) || {}).rows || {}, g, tot);
+    noteer('Prijzen ' + dk + ': ' + (voor - na) + ' kwartieren hersteld uit BE' + (na ? ', ' + na + ' nog zonder prijs (BE leverde ' + ((j && j.prices) || []).length + ' rijen)' : '') + '.');
+    return na;
+  }
+  async function verwerkPrijzen(id, j) {
+    if (!j || !Array.isArray(j.prices)) return;
+    var ctx = planning(j), events = new Set(j.afrrEventIsps || []), disc = {}, nu = Date.now();
+    (j.afrrDiscovery || []).forEach(function (d) { if (d && getal(d.start) && Array.isArray(d.directions)) disc[d.start] = d.directions; });
+    var arch = ((await lees(k(id, 'prijzen'))) || {}).rows || {};
+    j.prices.forEach(function (p) {
+      if (!p || !getal(p.start) || p.start % Q || p.carried) return;
+      var keus = prijsKeuze(p, ctx, events, disc), oud = arch[p.start] || {};
+      var tijdelijk = !!p.temporaryTariffs || (p.start <= nu && nu < p.start + Q);
+      arch[p.start] = {
+        mi: keus.mi, me: keus.me,
+        ki: keus.ki !== null ? keus.ki : (oud.mi === keus.mi ? oud.ki : null),
+        ke: keus.ke !== null ? keus.ke : (oud.me === keus.me ? oud.ke : null),
+        v: !!p.provisional || tijdelijk, t: nu
+      };
+    });
+    var grens = nu - PRIJS_DAGEN * 86400000;
+    Object.keys(arch).forEach(function (s) { if (+s < grens) delete arch[s]; });
+    await schrijf(k(id, 'prijzen'), { rows: arch });
+  }
+
+  /* ── Dagberekening ── */
+  async function cacheKwartieren(id, dk) {
+    var g = grenzen(dk); if (!g) return {};
+    var rows = ((await lees(k(id, 'rauw:' + dk))) || {}).rows || [];
+    var vorige = ((await lees(k(id, 'rauw:' + plusDagen(dk, -1)))) || {}).rows || [];
+    if (vorige.length) rows = [vorige[vorige.length - 1]].concat(rows);
+    var kw = naarKwartieren(rows), uit = {};
+    Object.keys(kw).forEach(function (q) { if (+q >= g.start && +q < g.eind) uit[q] = kw[q]; });
+    return uit;
+  }
+  // Prijsarchief van Balansenergie All-in (6.8.x), ALLEEN LEZEN. Bestaat de
+  // database niet, dan wordt het aanmaken direct afgebroken: All-in moet zijn
+  // eigen database met eigen store kunnen aanmaken.
+  var allinCache = { at: 0, id: '', rows: {} };
+  function leesAllinArchief(id) {
+    return new Promise(function (resolve) {
+      var klaar = false, r;
+      function uit(v) { if (!klaar) { klaar = true; resolve(v); } }
+      try { r = indexedDB.open('balansenergie-bronnen-v1'); } catch (e) { uit(null); return; }
+      r.onupgradeneeded = function () { try { r.transaction.abort(); } catch (e) {} };
+      r.onerror = function () { uit(null); }; r.onblocked = function () { uit(null); };
+      r.onsuccess = function () {
+        var d = r.result;
+        try {
+          if (!d.objectStoreNames.contains('dagen')) { d.close(); uit(null); return; }
+          var q = d.transaction('dagen', 'readonly').objectStore('dagen').get(id + ':prijzen');
+          q.onsuccess = function () { d.close(); uit(q.result || null); };
+          q.onerror = function () { d.close(); uit(null); };
+        } catch (e) { try { d.close(); } catch (x) {} uit(null); }
+      };
+      setTimeout(function () { uit(null); }, 5000);
+    });
+  }
+  var LABEL = { onbalans_import: 'onbalans', afrr_import: 'aFRR', day_ahead_import: 'Dynamisch', day_ahead_afrr_import: 'Dynamisch + aFRR', onbalans_export: 'onbalans', afrr_export: 'aFRR' };
+  async function allinPrijzen(id) {
+    if (allinCache.id === id && Date.now() - allinCache.at < 120000) return allinCache.rows;
+    var bron = await leesAllinArchief(id), uit = {}, leeg = { authoritative: false, planned: new Set(), onbekend: function () { return false; } };
+    ((bron && bron.rows) || []).forEach(function (p) {
+      if (!p || !getal(p.start) || p.start % Q || p.carried) return;
+      var keus = prijsKeuze(p, leeg, new Set(), {}), ki = keus.ki, ke = keus.ke;
+      // Ontbrekende quote: laatste live-waarneming van dezelfde markt.
+      (Array.isArray(p.verloop) ? p.verloop : []).slice().reverse().forEach(function (o) {
+        if (!getal(ki) && keus.mi && o && o.marktImport === LABEL[keus.mi] && getal(o.ki)) ki = o.ki;
+        if (!getal(ke) && o && o.marktExport === LABEL[keus.me] && getal(o.ke)) ke = o.ke;
+      });
+      if (getal(ki) || getal(ke)) uit[p.start] = { ki: getal(ki) ? ki : null, ke: getal(ke) ? ke : null, mi: keus.mi, me: keus.me, v: p.provisional !== false, allin: true };
+    });
+    allinCache = { at: Date.now(), id: id, rows: uit };
+    return uit;
+  }
+  // Eigen archief eerst; ontbrekende kwartieren aangevuld uit het All-in-archief.
+  async function prijsIndex(id) {
+    var eigen = ((await lees(k(id, 'prijzen'))) || {}).rows || {}, extra = await allinPrijzen(id), uit = {};
+    Object.keys(extra).forEach(function (q) { uit[q] = extra[q]; });
+    Object.keys(eigen).forEach(function (q) {
+      var a = eigen[q], b = uit[q];
+      uit[q] = !b ? a : { ki: getal(a.ki) ? a.ki : b.ki, ke: getal(a.ke) ? a.ke : b.ke, mi: a.mi, me: a.me, v: a.v && b.v };
+    });
+    return uit;
+  }
+  function zetPrijzen(kw, prijzen) {
+    Object.keys(kw).forEach(function (q) {
+      var p = prijzen[q], x = kw[q];
+      if (!getal(x.pIn) && p) x.pIn = p.ki;
+      if (!getal(x.pUit) && p) x.pUit = p.ke;
+      if (p && p.v) x.prijsVoorlopig = true;
+    });
+    return kw;
+  }
+  async function dagUitCache(id, dk, tot, c) {
+    var g = grenzen(dk), eind = Math.min(g.eind, tot || g.eind), duur = Math.max(1, (eind - g.start) / 1000);
+    var kw = zetPrijzen(await cacheKwartieren(id, dk), await prijsIndex(id));
+    Object.keys(kw).forEach(function (q) { if (+q >= eind) delete kw[q]; });
+    var w = waardeer(kw, c, null);
+    return { dk: dk, bron: 'cache', kw: kw, w: w, dekking: Math.min(1, w.accuSec / duur), prijsDekking: Math.min(1, w.prijsSec / duur) };
+  }
+  function parseDefinitief(j, rij, dk) {
+    var lijst = j && j.day_detail && j.day_detail.intervals, g = grenzen(dk), out = {}, laden = 0, ontladen = 0, leegAccu = 0;
+    if (!j || j.interval !== 'day' || j.period !== dk || !j.pricing || j.pricing.include_vat !== false || j.pricing.include_delivery_cost !== false) throw Error('BE bevestigt dag of kale prijzen niet');
+    if (!Array.isArray(lijst) || !g) throw Error('Geen kwartierdata');
+    lijst.forEach(function (v) {
+      var q = typeof v.timestamp === 'number' ? v.timestamp : typeof v.timestamp === 'string' && /(Z|[+-]\d{2}:\d{2})$/.test(v.timestamp) ? Date.parse(v.timestamp) : NaN;
+      if (!getal(q) || q % Q || q < g.start || q >= g.eind || out[q]) throw Error('Onbekende of dubbele kwartiertijd');
+      var f = ['grid_import_kwh', 'grid_export_kwh'].filter(function (x) { return !getal(v[x]) || v[x] < 0; });
+      if (f.length) throw Error('Ontbrekend: ' + f.join(', ') + ' om ' + klok(q));
+      // Een los kwartier zonder accuwaarden (gezien om 00:00) telt als 0; het
+      // dagtotaal hieronder bewaakt dat er niets wezenlijks verdwijnt.
+      ['battery_charged_kwh', 'battery_discharged_kwh'].forEach(function (x) { if (v[x] != null && (!getal(v[x]) || v[x] < 0)) throw Error('Ongeldig: ' + x + ' om ' + klok(q)); });
+      var bl = getal(v.battery_charged_kwh) ? v.battery_charged_kwh : 0, bo = getal(v.battery_discharged_kwh) ? v.battery_discharged_kwh : 0;
+      if (!getal(v.battery_charged_kwh) || !getal(v.battery_discharged_kwh)) leegAccu++;
+      laden += bl; ontladen += bo;
+      out[q] = { imp: v.grid_import_kwh, exp: v.grid_export_kwh, laden: bl, ontladen: bo,
+        pIn: getal(v.effective_import_price_eur_per_kwh) ? v.effective_import_price_eur_per_kwh : null,
+        pUit: getal(v.effective_export_price_eur_per_kwh) ? v.effective_export_price_eur_per_kwh : null };
+    });
+    if (Object.keys(out).length !== (g.eind - g.start) / Q) throw Error('Kwartieren dekken niet de hele dag');
+    if (rij && getal(rij.battery_charged_kwh) && getal(rij.battery_discharged_kwh) &&
+      (Math.abs(laden - rij.battery_charged_kwh) > 0.15 || Math.abs(ontladen - rij.battery_discharged_kwh) > 0.15)) throw Error('Kwartieren sluiten niet aan op dagtotaal');
+    if (leegAccu > 4) throw Error(leegAccu + ' kwartieren zonder accuwaarden');
+    return out;
+  }
+  function afrrVan(rij) { if (!rij) return null; var a = rij.balance_energie_eur, b = rij.deal_customer_share_eur; return getal(a) || getal(b) ? (getal(a) ? a : 0) + (getal(b) ? b : 0) : null; }
+  async function haalDefinitief(id, dk, rij, force) {
+    var sig = JSON.stringify(rij), st = await lees(k(id, 'def:' + dk)), nu = Date.now();
+    var recent = nu - grenzen(dk).eind < 7 * 86400000;
+    if (st && st.v === 2 && st.sig === sig && (st.kw || (st.fout && !force)) && nu - st.at < (st.fout ? 86400000 : recent ? 6 * 3600000 : 30 * 86400000)) {
+      if (st.fout) throw Error(st.fout + ' (eerdere controle)');
+      return st.kw;
+    }
+    await wacht(1250);
+    var j = await beGet('/customer/' + encodeURIComponent(id) + '/results-v2-api/', { interval: 'day', period: dk, include_vat: '0', include_delivery_cost: '0' });
+    try { var kw = parseDefinitief(j, rij, dk); await schrijf(k(id, 'def:' + dk), { v: 2, sig: sig, at: nu, kw: kw }); return kw; }
+    catch (e) { await schrijf(k(id, 'def:' + dk), { v: 2, sig: sig, at: nu, fout: e.message }); throw e; }
+  }
+  // BE's effectieve kwartierprijs is kosten / kWh: bij heel weinig afname of
+  // teruglevering in dat kwartier ontspoort hij. Dan liever de marktprijs.
+  function prijsBetrouwbaar(p, kwh) { return getal(p) && Math.abs(p) <= MAX_KAAL && kwh >= MIN_KWH; }
+  function kiesPrijzen(kw, bron, prijzen, rij) {
+    var gemIn = rij && getal(rij.avg_buy_price_eur_per_kwh) && Math.abs(rij.avg_buy_price_eur_per_kwh) <= MAX_KAAL ? rij.avg_buy_price_eur_per_kwh : null;
+    var gemUit = rij && getal(rij.avg_sell_price_eur_per_kwh) && Math.abs(rij.avg_sell_price_eur_per_kwh) <= MAX_KAAL ? rij.avg_sell_price_eur_per_kwh : null;
+    Object.keys(kw).forEach(function (q) {
+      var x = kw[q], b = bron[q] || {}, a = prijzen[q], bronIn = 'BE', bronUit = 'BE';
+      x.pIn = prijsBetrouwbaar(b.pIn, b.imp) ? b.pIn : null; x.pUit = prijsBetrouwbaar(b.pUit, b.exp) ? b.pUit : null;
+      if (!getal(x.pIn) && a && getal(a.ki) && Math.abs(a.ki) <= MAX_KAAL) { x.pIn = a.ki; bronIn = a.allin ? 'markt/All-in' : 'markt'; if (a.v) x.prijsVoorlopig = true; }
+      if (!getal(x.pUit) && a && getal(a.ke) && Math.abs(a.ke) <= MAX_KAAL) { x.pUit = a.ke; bronUit = a.allin ? 'markt/All-in' : 'markt'; if (a.v) x.prijsVoorlopig = true; }
+      if (!getal(x.pIn) && getal(gemIn)) { x.pIn = gemIn; bronIn = 'daggemiddelde'; x.prijsGeschatIn = true; }
+      if (!getal(x.pUit) && getal(gemUit)) { x.pUit = gemUit; bronUit = 'daggemiddelde'; x.prijsGeschatUit = true; }
+      x.prijsBron = bronIn === bronUit ? bronIn : 'in ' + bronIn + ' / uit ' + bronUit;
+    });
+    return kw;
+  }
+  async function dagDefinitief(id, dk, rij, c, force) {
+    var bron = await haalDefinitief(id, dk, rij, force), d = verdeelDefinitief(bron, await cacheKwartieren(id, dk));
+    // Ontlaadt de accu naar huis, dan is de afname ~0 en BE's effectieve prijs
+    // onbruikbaar. De marktprijs van dat kwartier is dan de juiste waardering.
+    if (dk >= plusDagen(vandaag(), -1)) { try { await herstelPrijzenDag(id, dk, 6 * 3600000); } catch (e) { if (e.pauze) throw e; noteer('Prijzen ' + dk + ': ' + e.message); } }
+    var kw = kiesPrijzen(d.kw, bron, await prijsIndex(id), rij), w = waardeer(kw, c, c.afrr ? afrrVan(rij) : null);
+    var duur = (grenzen(dk).eind - grenzen(dk).start) / 1000;
+    return { dk: dk, bron: 'BE', kw: kw, w: w, dekking: 1, prijsDekking: Math.min(1, w.prijsSec / duur), uitCache: d.uitCache, geschat: d.geschat };
+  }
+  var maandCache = {};
+  async function maandBron(id, ym, maxLeeftijd) {
+    var m = maandCache[id + ym];
+    if (m && Date.now() - m.at < maxLeeftijd) return m.j;
+    var j = await beGet('/customer/' + encodeURIComponent(id) + '/results-v2-api/', { interval: 'month', period: ym, include_vat: '0', include_delivery_cost: '0' });
+    if (!j || j.interval !== 'month' || j.period !== ym || !Array.isArray(j.series)) throw Error('Onverwacht maandantwoord voor ' + ym);
+    maandCache[id + ym] = { at: Date.now(), j: j };
+    return j;
+  }
+  function rijVan(j, dk) { return (j.series || []).find(function (r) { return r && r.date === dk; }) || null; }
+
+  /* ── Payloads ── */
+  function e2(n) { return (getal(n) ? (Math.abs(n) < 0.005 ? 0 : n) : 0).toFixed(2); }
+  function k3(n) { return Math.max(0, getal(n) ? n : 0).toFixed(3); }
+  function k4(n) { return Math.max(0, getal(n) ? n : 0).toFixed(4); }
+  function intervallen(kw) {
+    return Object.keys(kw).map(Number).sort(function (a, b) { return a - b; }).slice(0, 100).map(function (q) {
+      var x = kw[q], o = { start: isoAms(q),
+        batteryChargedKwh: k4(getal(x.geladen) ? x.geladen : x.ladNet + x.ladPV),
+        batteryDischargedKwh: k4(getal(x.ontladen) ? x.ontladen : x.ontHuis + x.ontNet),
+        gridImportedKwh: k4(x.imp), gridExportedKwh: k4(x.exp) };
+      if (getal(x.soc)) o.batteryEndSoc = x.soc.toFixed(1);
+      return o;
+    });
+  }
+  /* ── Afstemming met de Home Assistant-integratie (gelijk aan calc.py) ──
+   * Label achter elke dagnotitie: [BEMB v=… bron=ha|browser type=be|cache dekking=… actief=…]
+   * 'actief' zet alleen Home Assistant (heartbeat, elke 15 min). */
+  function maakLabel(bron, type, dekking, actief) {
+    return '[BEMB v=' + VERSIE + ' bron=' + bron + ' type=' + type + ' dekking=' + (100 * dekking).toFixed(1) + (actief ? ' actief=' + actief : '') + ']';
+  }
+  function leesLabel(note) {
+    var m = typeof note === 'string' && /\[BEMB ([^\]]*)\]/.exec(note); if (!m) return null;
+    var o = {}; m[1].split(/\s+/).forEach(function (x) { var i = x.indexOf('='); if (i > 0) o[x.slice(0, i)] = x.slice(i + 1); }); return o;
+  }
+  function magOverschrijven(bestaand, type, dekking) {
+    var lab = leesLabel(bestaand && bestaand.note);
+    if (!lab) return { mag: true, reden: '' };
+    if (lab.type === 'be' && type !== 'be') return { mag: false, reden: 'definitieve versie staat er al' };
+    if (lab.type === 'cache' && type === 'cache') {
+      var oud = Number(lab.dekking); if (!isFinite(oud)) oud = 0;
+      if (oud > 100 * dekking + 0.05) return { mag: false, reden: 'bestaande versie heeft meer dekking (' + oud.toFixed(1) + '%)' };
+    }
+    return { mag: true, reden: '' };
+  }
+  // Home Assistant actief? Jongste 'actief' in een label met bron=ha, max. 40 min oud.
+  var HA_GRENS = 40 * 60000, haStatus = { at: 0, actief: null, dk: null, gecontroleerd: 0 };
+  async function controleerHA(force) {
+    if (!heeftSleutel || (!force && Date.now() - haStatus.gecontroleerd < 10 * 60000)) return haStatus;
+    var tot = plusDagen(vandaag(), -1), van = plusDagen(vandaag(), -DAG_VENSTER), a = await mb('GET', '/api/results/daily?from=' + van + '&to=' + tot), j;
+    try { j = JSON.parse(a.text); } catch (e) { j = {}; }
+    var best = null, bestDk = null;
+    ((j && j.results) || (Array.isArray(j) ? j : [])).forEach(function (r) {
+      var lab = leesLabel(r && r.note), t = lab && lab.bron === 'ha' && lab.actief ? Date.parse(lab.actief) : NaN;
+      if (isFinite(t) && (!best || t > best)) { best = t; bestDk = r.date; }
+    });
+    haStatus = { at: best || 0, actief: !!best && Date.now() - best < HA_GRENS, dk: bestDk, gecontroleerd: Date.now() };
+    return haStatus;
+  }
+  function haNeemtOver(c) { return c.afstemming !== 'altijd' && haStatus.actief; }
+  function dagPayload(r, c) {
+    // Meer dan 2 uur met daggemiddelde prijs: geen kwartierwaardering meer, dus als onzeker markeren.
+    var w = r.w, invalid = r.bron === 'cache' ? (r.dekking < 0.99 || r.prijsDekking < 0.99 || w.zonderPrijs > 0) : (w.zonderPrijs > 0 || (w.geschattePrijs || 0) > 8);
+    var note = (r.bron === 'BE' ? 'BE definitief' : 'Voorlopig uit browsercache, dekking ' + (100 * r.dekking).toFixed(1) + '%') +
+      (w.geschattePrijs ? '. ' + w.geschattePrijs + ' kwartieren met daggemiddelde prijs' : '') + '. All-in' + (c.saldeert ? ', EB op teruglevering t/m 2026' : ', zonder EB op teruglevering') +
+      '. Besparing = ontladen naar huis minus evenredige laadkosten; handel = ontladen naar net minus evenredige laadkosten' +
+      (r.bron === 'BE' && c.afrr ? ' plus aFRR-vergoeding' : '') + '.';
+    var label = maakLabel('browser', r.bron === 'BE' ? 'be' : 'cache', r.dekking);
+    note = note.slice(0, 480 - label.length - 1) + ' ' + label;
+    return { date: r.dk, batteryResult: e2(w.totaal), batterySavings: e2(w.besparing),
+      chargedToday: k3(w.geladen), dischargedToday: k3(w.ontladen), invalid: !!invalid, note: note, intervals: intervallen(r.kw) };
+  }
+
+  /* ── Rondes ── */
+  function lock(naam, fn) {
+    if (navigator.locks && navigator.locks.request) return navigator.locks.request(naam, { ifAvailable: true }, function (l) { return l ? fn() : null; });
+    return fn();
+  }
+  async function verzamel() {
+    var id = klant(); if (!id || document.hidden) return;
+    return lock('bemb-verzamel', async function () {
+      try { await verzamelPrijzen(id); } catch (e) { noteer('Prijzen: ' + e.message); }
+      try { await verzamelRauw(id); } catch (e) { noteer('Metingen: ' + e.message); }
+      laatsteVerzameling = Date.now();
+    });
+  }
+  var laatsteVerzameling = 0, laatsteLive = null, laatsteDagronde = 0;
+  async function liveRonde(handmatig) {
+    var id = klant(), c = cfg(); if (!id) throw Error('Geen installatie bekend');
+    if (!handmatig && (!c.auto || !heeftSleutel)) return;
+    try { await controleerHA(false); } catch (e) {}
+    if (haNeemtOver(c)) throw Error('Home Assistant verstuurt (actief ' + klok(haStatus.at) + ').');
+    return lock('bemb-live', async function () {
+      var nu = Date.now(), dk = dagVan(nu);
+      var rows = ((await lees(k(id, 'rauw:' + dk))) || {}).rows || [], m = null;
+      for (var i = rows.length - 1; i >= 0; i--) if (getal(rows[i].bo)) { m = rows[i]; break; }
+      if (!m || nu - m.t > 300000) throw Error('Geen actuele accumeting (jonger dan 5 min); live niet verstuurd');
+      var r = await dagUitCache(id, dk, m.t, c), w = r.w;
+      var p = { timestamp: isoAms(m.t), batteryResult: e2(w.totaal), batterySavings: e2(w.besparing),
+        chargedToday: k3(w.geladen), dischargedToday: k3(w.ontladen), gridImportToday: k3(w.imp), gridExportToday: k3(w.exp),
+        invalid: r.dekking < 0.99 || w.zonderPrijs > 0 };
+      if (getal(m.s) && m.s >= 0 && m.s <= 100) p.batteryCharge = m.s.toFixed(1);
+      if (c.proef) p.test = true;
+      await mb('POST', '/api/live', p);
+      laatsteLive = { at: Date.now(), p: p };
+      noteer('Live ' + (c.proef ? 'gevalideerd (proef)' : 'verstuurd') + ': totaal € ' + p.batteryResult + ', besparing € ' + p.batterySavings + (p.invalid ? ' · onvolledig' : ''));
+      render();
+    });
+  }
+  // Eén dag bepalen: BE definitief als de dag complete is, anders de cache.
+  async function bepaalDag(id, dk, maandJ, c, force, rapport) {
+    var rij = maandJ ? rijVan(maandJ, dk) : null;
+    if (rij && rij.status === 'complete') {
+      try { return await dagDefinitief(id, dk, rij, c, force); }
+      catch (e) { if (e.pauze) throw e; rapport.push(dk + ': BE complete maar niet bruikbaar (' + e.message + '); cache gebruikt.'); }
+    }
+    var r = await dagUitCache(id, dk, null, c);
+    return r.dekking >= MIN_DEKKING_VOORLOPIG ? r : null;
+  }
+  async function verstuurDag(id, r, c, rapport, bestaand) {
+    if (bestaand !== undefined) {
+      var regel = magOverschrijven(bestaand, r.bron === 'BE' ? 'be' : 'cache', r.dekking);
+      if (!regel.mag) { rapport.push(r.dk + ': niet vervangen — ' + regel.reden + (((leesLabel(bestaand && bestaand.note) || {}).bron === 'ha') ? ' (Home Assistant)' : '') + '.'); return false; }
+    }
+    var p = dagPayload(r, c), hash = JSON.stringify(p), sk = k(id, (c.proef ? 'proef:' : 'sent:') + r.dk), st = await lees(sk);
+    if (st && st.bron === 'BE' && r.bron !== 'BE') { rapport.push(r.dk + ': definitieve versie al verstuurd; cache niet teruggezet.'); return false; }
+    if (st && st.hash === hash) return false;
+    var body = c.proef ? Object.assign({ test: true }, p) : p;
+    await mb('POST', '/api/results/daily', body);
+    await schrijf(sk, { hash: hash, bron: r.bron, at: Date.now(), totaal: p.batteryResult, besparing: p.batterySavings, payload: body });
+    rapport.push(r.dk + ': ' + (c.proef ? 'gevalideerd (proef)' : 'verstuurd') + ' · ' + r.bron + ' · € ' + p.batteryResult + ' (besparing € ' + p.batterySavings + ')' + (p.invalid ? ' · onvolledig' : ''));
+    return true;
+  }
+  async function dagRonde(handmatig) {
+    var id = klant(), c = cfg(); if (!id) throw Error('Geen installatie bekend');
+    if (!handmatig && (!c.auto || !heeftSleutel)) return;
+    try { await controleerHA(handmatig); } catch (e) { noteer('HA-controle: ' + e.message); }
+    if (haNeemtOver(c)) { var m = 'Dagen: Home Assistant verstuurt (actief ' + klok(haStatus.at) + '); browser doet niets.'; noteer(m); laatsteDagronde = Date.now(); render(); return m; }
+    return lock('bemb-dagen', async function () {
+      var rapport = [], vandaagK = vandaag(), dagen = [];
+      for (var i = DAG_VENSTER; i >= 1; i--) dagen.push(plusDagen(vandaagK, -i));
+      var bestaand = null;
+      try { var ba = await mb('GET', '/api/results/daily?from=' + dagen[0] + '&to=' + dagen[dagen.length - 1]), bj = JSON.parse(ba.text); bestaand = {};
+        ((bj && bj.results) || []).forEach(function (x) { if (x && x.date) bestaand[String(x.date).slice(0, 10)] = x; }); }
+      catch (e) { rapport.push('Mijnbatterij-records niet opgehaald (' + e.message + '); geen dagen verstuurd.'); return rapport.join('\n'); }
+      var maandJ = {};
+      for (var ym of Array.from(new Set(dagen.map(function (d) { return d.slice(0, 7); })))) {
+        try { maandJ[ym] = await maandBron(id, ym, handmatig ? 60000 : 2 * 3600000); }
+        catch (e) { if (e.pauze) { rapport.push(e.message); break; } rapport.push(ym + ': ' + e.message); }
+      }
+      for (var dk of dagen) {
+        try {
+          var r = await bepaalDag(id, dk, maandJ[dk.slice(0, 7)], c, handmatig, rapport);
+          if (!r) continue;
+          await verstuurDag(id, r, c, rapport, bestaand[dk] || null);
+        } catch (e) { rapport.push(dk + ': ' + e.message); if (e.pauze) break; }
+      }
+      laatsteDagronde = Date.now();
+      if (!rapport.length) rapport.push('Dagen: niets gewijzigd.');
+      rapport.forEach(noteer); render();
+      return rapport.join('\n');
+    });
+  }
+  var historieStop = false, historieBezig = false;
+  async function historie(vanYm) {
+    var id = klant(), c = cfg(); if (!id) throw Error('Geen installatie bekend');
+    if (!/^\d{4}-\d{2}$/.test(vanYm)) throw Error('Kies een startmaand');
+    if (historieBezig) throw Error('Historie loopt al');
+    historieBezig = true; historieStop = false;
+    var rapport = [];
+    try {
+      var gestart = false;
+      await lock('bemb-dagen', async function () {
+        gestart = true;
+        var vk = vandaag(), lijst = maanden(vanYm, vk.slice(0, 7));
+        for (var ym of lijst) {
+          if (historieStop) { rapport.push('Gestopt door gebruiker.'); break; }
+          var j; try { await wacht(1250); j = await maandBron(id, ym, 60000); }
+          catch (e) { rapport.push(ym + ': ' + e.message); if (e.pauze) break; continue; }
+          var dagen = (j.series || []).map(function (r) { return r && r.date; }).filter(function (d) { return typeof d === 'string' && d.slice(0, 7) === ym && d < vk; }).sort();
+          var som = { t: 0, b: 0, l: 0, o: 0, n: 0, alles: true };
+          for (var dk of dagen) {
+            if (historieStop) break;
+            status('Historie ' + ym + ': ' + dk + ' …');
+            var rij = rijVan(j, dk);
+            if (!rij || rij.status !== 'complete') { som.alles = false; continue; }
+            try {
+              var r = await dagDefinitief(id, dk, rij, c, false);
+              await verstuurDag(id, r, c, rapport);
+              som.t += r.w.totaal; som.b += r.w.besparing; som.l += r.w.geladen; som.o += r.w.ontladen; som.n++;
+            } catch (e) { som.alles = false; rapport.push(dk + ': ' + e.message); if (e.pauze) { historieStop = true; break; } }
+          }
+          // Maandtotaal alleen voor afgelopen, volledig berekende maanden.
+          if (ym < vk.slice(0, 7) && som.alles && som.n && som.n === dagen.length) {
+            var mp = { yearMonth: ym, batteryResult: e2(som.t), batterySavings: e2(som.b), batteryCharged: k3(som.l), batteryDischarged: k3(som.o),
+              partial: som.n < dagenInMaand(ym), note: 'Som van ' + som.n + ' BE-definitieve dagen. BE-Mijnbatterij ' + VERSIE + '.' };
+            var mk = k(id, 'maand:' + ym), oud = await lees(mk), hash = JSON.stringify(mp);
+            if (c.proef) rapport.push(ym + ': maandtotaal € ' + mp.batteryResult + ' (besparing € ' + mp.batterySavings + ') — proefstand, niet verstuurd (maand-API kent geen testvlag).');
+            else if (!oud || oud.hash !== hash) {
+              try { await mb('POST', '/api/results/monthly', mp); await schrijf(mk, { hash: hash, at: Date.now() }); rapport.push(ym + ': maandtotaal verstuurd € ' + mp.batteryResult + '.'); }
+              catch (e) { rapport.push(ym + ': maandtotaal mislukt: ' + e.message); }
+            } else rapport.push(ym + ': maandtotaal ongewijzigd.');
+          } else if (ym < vk.slice(0, 7)) rapport.push(ym + ': ' + som.n + '/' + dagen.length + ' dagen definitief; maandtotaal niet vervangen.');
+        }
+      });
+      if (!gestart) rapport.push('Er loopt al een dagronde; probeer het zo opnieuw.');
+    } finally { historieBezig = false; }
+    rapport.forEach(noteer); render();
+    return rapport.join('\n');
+  }
+
+  /* ── Planner ── */
+  async function tik() {
+    try {
+      if (document.hidden) return;
+      await verzamel();
+      var c = cfg();
+      try { await controleerHA(false); } catch (e) {}
+      if (c.auto && heeftSleutel) {
+        try { await liveRonde(false); } catch (e) { noteer(e.message); }
+        if (Date.now() - laatsteDagronde > 30 * 60000) { try { await dagRonde(false); } catch (e) { noteer(e.message); } }
+      }
+      if (opened) render();
+    } catch (e) { noteer(e.message); }
+  }
+
+  /* ── Pagina in het menu ── */
+  var root = null, shadow = null, opened = false, navLinks = [], activeBefore = [], menuSerial = 0;
+  function $(id) { return shadow.getElementById(id); }
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+  function euro(n) { return getal(n) ? new Intl.NumberFormat('nl-NL', { style: 'currency', currency: 'EUR' }).format(Math.abs(n) < 0.005 ? 0 : n) : '—'; }
+  function kwhT(n) { return getal(n) ? n.toLocaleString('nl-NL', { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + ' kWh' : '—'; }
+  function pct(n) { return getal(n) ? (100 * n).toLocaleString('nl-NL', { maximumFractionDigits: 1 }) + '%' : '—'; }
+  function cls(n) { return getal(n) ? (n >= 0 ? 'pos' : 'neg') : ''; }
+  function status(s) { if (shadow) $('status').textContent = s; }
+  function donker() { return document.documentElement.getAttribute('data-be-dark') === 'aan'; }
+  function thema() {
+    if (!root) return;
+    if (donker()) root.setAttribute('data-dark', ''); else root.removeAttribute('data-dark');
+    var stijl = window.BETheme && typeof window.BETheme.style === 'function' ? window.BETheme.style() : '';
+    if (stijl) root.setAttribute('data-dark-style', stijl); else root.removeAttribute('data-dark-style');
+  }
+  function knop(label, attr) { return '<button type="button" ' + (attr || '') + '>' + label + '</button>'; }
+  function schakel(id, titel, uitleg) {
+    return '<label class="switch"><input type="checkbox" id="' + id + '"><span class="track" aria-hidden="true"><span></span></span><span><strong>' + titel + '</strong><small>' + uitleg + '</small></span></label>';
+  }
+  function mount() {
+    if (root) return;
+    root = document.createElement('section'); root.id = 'bemb-root'; root.hidden = true;
+    root.style.cssText = 'position:fixed;left:0;right:0;top:0;bottom:0;z-index:1039;overflow:auto;overscroll-behavior:contain';
+    shadow = root.attachShadow({ mode: 'open' });
+    shadow.innerHTML = '<style>' +
+      ':host{--bg:#f6f7fb;--paper:#fff;--ink:#292633;--muted:#74717e;--line:#e7e4ec;--purple:#714291;--soft:#f1edf6;--green:#208557;--red:#c64151;--button:#714291;color-scheme:light;font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink)}' +
+      ':host([data-dark]){--bg:#282723;--paper:#36342f;--ink:#f5f0e8;--muted:#c0b8ab;--line:#575148;--purple:#cfb3f0;--soft:#44384f;--green:#62d0ad;--red:#ff96a8;--button:#8057a4;color-scheme:dark}' +
+      ':host([data-dark][data-dark-style="grafiet"]){--bg:#111316;--paper:#1c1f26;--ink:#f5f7fa;--muted:#b6c0cf;--line:#3c4351;--purple:#a879ff;--soft:#262a34;--green:#23d9a0;--red:#ff6079;--button:#7340b5}' +
+      '*{box-sizing:border-box}[hidden]{display:none!important}h1,h2,p{margin:0}h1{font-size:23px}h2{font-size:16px;margin-bottom:10px}small,.muted{color:var(--muted)}' +
+      'button,input,select{font:inherit;color:var(--ink)}button,input[type=month],input[type=password]{border:1px solid var(--line);border-radius:7px;background:var(--paper);padding:8px 12px;min-height:38px}button{cursor:pointer}button:hover{border-color:var(--purple)}button:disabled{opacity:.5;cursor:default}button.primary{background:var(--button);border-color:var(--button);color:#fff;font-weight:600}' +
+      'button:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid var(--purple);outline-offset:2px}' +
+      '.page{padding:24px 28px 40px;background:var(--bg);min-height:100%}.wrap{max-width:1100px;margin:auto}.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}' +
+      '.pill{display:inline-block;font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;background:var(--soft);color:var(--purple);margin-left:6px}.pill.warn{color:var(--red)}' +
+      '.panel{background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:18px;margin-top:14px}' +
+      '.tiles{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.tile{background:var(--soft);border-radius:8px;padding:12px 14px}.tile small{display:block;font-size:11px}.tile strong{font-size:22px;font-variant-numeric:tabular-nums}.tile .sub{font-size:11px;color:var(--muted);margin-top:2px}' +
+      '.pos{color:var(--green)}.neg{color:var(--red)}' +
+      '.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}table{border-collapse:collapse;width:100%;font-size:13px;white-space:nowrap}th,td{text-align:right;padding:8px 10px;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}th{font-size:10px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);font-weight:600}' +
+      'tr.dag{cursor:pointer}tr.dag:hover{background:var(--soft)}tr.detail td{text-align:left;white-space:normal;background:var(--soft)}.ok{color:var(--green)}.afw{color:var(--red);font-weight:600}' +
+      '.tag{font-size:11px;padding:2px 7px;border-radius:5px;background:var(--soft)}.tag.be{color:var(--green)}.tag.cache{color:var(--purple)}' +
+      '.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.row input[type=password]{flex:1;min-width:220px}' +
+      '.switch{display:flex;gap:12px;align-items:flex-start;padding:10px 0;border-bottom:1px solid var(--line);cursor:pointer}.switch input{position:absolute;opacity:0;pointer-events:none}.switch small{display:block;font-size:12px}' +
+      '.track{flex:none;position:relative;width:44px;height:24px;border-radius:12px;background:var(--line);transition:background .2s;margin-top:2px}.track span{position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 3px #0003;transition:transform .2s}' +
+      '.switch input:checked+.track{background:var(--button)}.switch input:checked+.track span{transform:translateX(20px)}.switch input:focus-visible+.track{outline:2px solid var(--purple);outline-offset:2px}' +
+      '.notice{font-size:12px;color:var(--muted);margin-top:10px;min-height:18px}pre{white-space:pre-wrap;font:11px/1.55 ui-monospace,Menlo,monospace;background:var(--soft);border-radius:8px;padding:10px;max-height:260px;overflow:auto;margin:10px 0 0}' +
+      'details summary{cursor:pointer;font-weight:600}.uitleg p{font-size:13px;margin-top:8px}.mobile-menu{display:none}' +
+      '@media(max-width:767px){.page{padding:12px 10px 28px}.tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.tile strong{font-size:18px}.panel{padding:12px}button,input[type=month],input[type=password]{min-height:44px;font-size:16px}h1{font-size:20px}}' +
+      '</style><div class="page"><div class="wrap">' +
+      '<header class="top"><h1>Mijnbatterij <small style="font-size:11px;font-weight:500">' + VERSIE + '</small><span id="pill-auto" class="pill"></span><span id="pill-proef" class="pill warn"></span></h1>' +
+      '<div class="row">' + knop('Nu delen', 'id="nu" class="primary"') + knop('↻', 'id="ververs" aria-label="Vernieuwen"') + '</div></header>' +
+      '<div id="status" class="notice" role="status" aria-live="polite"></div>' +
+      '<section class="panel"><h2>Vandaag <small id="live-info" style="font-weight:400;font-size:12px"></small></h2><div class="tiles" id="tiles"></div></section>' +
+      '<section class="panel"><h2>Afgelopen dagen</h2><div class="table-wrap"><table><thead><tr><th>Datum</th><th>Bron</th><th>Dekking</th><th>Handel</th><th>Besparing</th><th>Totaal</th><th>Geladen</th><th>Ontladen</th><th>Verstuurd</th><th>Op Mijnbatterij</th></tr></thead><tbody id="dagen"></tbody></table></div>' +
+      '<div class="actions">' + knop('Vergelijk met Mijnbatterij', 'id="vergelijk"') + '<span class="notice" id="vergelijk-info" style="margin:0;align-self:center">Klik op een dag voor de exacte payload en wat Mijnbatterij opsloeg.</span></div><pre id="maand-mb" style="margin-top:8px"></pre>' +
+      '<p class="notice">Tot BE een dag als complete markeert (ca. 48 uur) komt de dag uit de eigen browsercache van de ruwe metingen (max. 26 uur terug op te halen). Daarna wordt hij met de BE-kwartierdata opnieuw berekend en overschreven.</p></section>' +
+      '<section class="panel"><h2>Instellingen</h2>' +
+      '<div class="row"><input id="key" type="password" autocomplete="off" placeholder="Mijnbatterij API-sleutel (profielpagina)">' + knop('Opslaan', 'id="key-save"') + knop('Controleren', 'id="key-test"') + knop('Wissen', 'id="key-wis"') + '</div>' +
+      '<p class="notice" id="key-state"></p>' +
+      schakel('c-auto', 'Automatisch delen in deze browser', 'Live elke 2 minuten, dagresultaten elk half uur. Zet dit maar in één browser aan; twee verzenders overschrijven elkaar.') +
+      schakel('c-proef', 'Proefstand', 'Live en dagen gaan met test: true naar Mijnbatterij: gevalideerd, niet opgeslagen. Maandtotalen worden in proefstand niet verstuurd.') +
+      schakel('c-saldeert', 'EB op teruglevering (t/m 2026)', 'Terugleverprijs inclusief energiebelasting zolang salderen geldt. Vanaf 2027 altijd zonder.') +
+      schakel('c-afrr', 'aFRR-vergoedingen meetellen als handel', 'balance_energie_eur + deal_customer_share_eur uit de BE-dagbron; alleen bij definitieve dagen bekend.') +
+      '<div class="row" style="margin-top:14px"><label class="muted" for="c-afstemming" style="font-size:12px">Afstemming met Home Assistant</label><select id="c-afstemming" style="border:1px solid var(--line);border-radius:7px;background:var(--paper);padding:8px 10px;min-height:38px"><option value="auto">Automatisch: HA verstuurt als die actief is</option><option value="altijd">Altijd zelf versturen</option></select></div>' +
+      '<p class="notice" id="ha-state"></p>' +
+      '<div class="row" style="margin-top:14px"><label class="muted" for="hist-van" style="font-size:12px">Historie herstellen vanaf</label><input id="hist-van" type="month">' + knop('Herstellen', 'id="hist"') + knop('Stoppen', 'id="hist-stop" hidden') + '</div>' +
+      '<p class="notice">Haalt alle BE-complete dagen vanaf die maand op (ca. 1,3 s per dag), stuurt gewijzigde dagresultaten en vervangt maandtotalen van volledig berekende afgelopen maanden.</p></section>' +
+      '<details class="panel uitleg"><summary>Rekenregels</summary>' +
+      '<p>Per meetsegment krijgt het huis eerst de zonnestroom. Laadt de accu, dan eerst uit het zonne-overschot (gewaardeerd tegen de terugleverprijs die je misloopt) en de rest uit het net (afnameprijs). Ontladen dekt eerst het huis (vermeden afnameprijs), de rest gaat naar het net (terugleverprijs).</p>' +
+      '<p>Besparing = ontladen naar huis × afnameprijs − het deel van de laadkosten dat bij die kWh hoort. Handel = ontladen naar net × terugleverprijs − het overige deel van de laadkosten, plus aFRR-vergoedingen. batteryResult = handel + besparing; Mijnbatterij leidt handel daaruit af.</p>' +
+      '<p>All-in: kale BE-prijs × 1,21 ± € 0,02 opslag, plus energiebelasting op afname (2025 € 0,12286, 2026 € 0,11085, 2027 € 0,10650 incl. btw). Live en voorlopige dagen gebruiken de onbalans-/aFRR-/day-ahead-prijzen die deze browser heeft vastgelegd; definitieve dagen de effectieve kwartierprijzen van BE.</p>' +
+      '<p>Definitieve BE-kwartieren geven bruto kWh maar niet de volgorde binnen het kwartier. Waar de eigen cache het kwartier dekt, wordt die verdeling gebruikt; anders de netto accubeweging per kwartier. Conversieverliezen zitten in de gemeten stromen.</p></details>' +
+      '<details class="panel"><summary>Activiteit</summary><pre id="log"></pre></details>' +
+      '</div></div>';
+    document.body.appendChild(root);
+    thema();
+    var c = cfg();
+    [['c-auto', 'auto'], ['c-proef', 'proef'], ['c-saldeert', 'saldeert'], ['c-afrr', 'afrr']].forEach(function (p) {
+      $(p[0]).checked = !!c[p[1]];
+      $(p[0]).onchange = function () {
+        zetCfg(p[1], $(p[0]).checked);
+        // Rekenwijzigingen: niets ongemerkt doorsturen.
+        if (p[1] === 'saldeert' || p[1] === 'afrr') { zetCfg('proef', true); $('c-proef').checked = true; status('Rekenwijziging: proefstand weer aan.'); }
+        render(); if (p[1] === 'auto' && $(p[0]).checked) tik();
+      };
+    });
+    $('vergelijk').onclick = async function () {
+      var b = $('vergelijk'); b.disabled = true; $('vergelijk-info').textContent = 'Ophalen bij Mijnbatterij…';
+      try { var n = await vergelijkMijnbatterij(); $('vergelijk-info').textContent = n + ' dagen opgehaald om ' + klok(mbOpgehaald) + '. ✓ = totaal en kWh gelijk aan wat wij stuurden, ⚠ = afwijkend. Besparing geeft Mijnbatterij alleen per maand terug.'; render(); }
+      catch (e) { $('vergelijk-info').textContent = e.message; } finally { b.disabled = false; }
+    };
+    $('dagen').onclick = function (e) {
+      var tr = e.target.closest('tr.dag'); if (!tr) return;
+      var open = tr.nextElementSibling && tr.nextElementSibling.classList.contains('detail');
+      shadow.querySelectorAll('tr.detail').forEach(function (x) { x.remove(); });
+      if (open) return;
+      var det = document.createElement('tr'); det.className = 'detail';
+      det.innerHTML = '<td colspan="10"><strong>Grootste kwartierbijdragen (all-in prijzen)</strong><pre>' + esc(tr.dataset.top || '—') + '</pre><strong>Verstuurd</strong><pre>' + esc(tr.dataset.payload || 'Nog niets verstuurd voor deze dag.') + '</pre><strong>Op Mijnbatterij</strong><pre>' + esc(tr.dataset.mb || 'Niet opgehaald of niet aanwezig. Gebruik “Vergelijk met Mijnbatterij”.') + '</pre></td>';
+      tr.insertAdjacentElement('afterend', det);
+    };
+    $('c-afstemming').value = c.afstemming || 'auto';
+    $('c-afstemming').onchange = function () { zetCfg('afstemming', $('c-afstemming').value); render(); };
+    $('hist-van').value = c.historieVan || plusDagen(vandaag(), -90).slice(0, 7);
+    $('hist-van').max = vandaag().slice(0, 7);
+    $('hist-van').onchange = function () { zetCfg('historieVan', $('hist-van').value); };
+    $('key-save').onclick = async function () {
+      try { var a = await brug({ op: 'key-set', value: $('key').value }); if (!a.ok) throw Error(a.error); $('key').value = ''; heeftSleutel = !!a.hasKey; status(heeftSleutel ? 'Sleutel opgeslagen in de userscript-opslag.' : 'Sleutel gewist.'); render(); }
+      catch (e) { status(e.message); }
+    };
+    $('key-wis').onclick = async function () { try { await brug({ op: 'key-set', value: '' }); heeftSleutel = false; status('Sleutel gewist.'); render(); } catch (e) { status(e.message); } };
+    $('key-test').onclick = async function () {
+      status('Sleutel controleren…');
+      try { var a = await mb('GET', '/api/me'), j = {}; try { j = JSON.parse(a.text); } catch (e) {} status('Sleutel werkt' + (j.username || j.name ? ' · ' + (j.username || j.name) : '') + '.'); }
+      catch (e) { status(e.message); }
+    };
+    $('nu').onclick = async function () {
+      var b = $('nu'); b.disabled = true; status('Verzamelen en delen…');
+      try { await verzamel(); var uit = []; try { await liveRonde(true); uit.push('Live ok.'); } catch (e) { uit.push('Live: ' + e.message); } uit.push(await dagRonde(true) || 'Dagen: er loopt al een ronde.'); status(uit.join(' · ').slice(0, 400)); }
+      catch (e) { status(e.message); } finally { b.disabled = false; render(); }
+    };
+    $('ververs').onclick = async function () { status('Verzamelen…'); await verzamel(); render(); status('Bijgewerkt ' + klok(Date.now()) + '.'); };
+    $('hist').onclick = async function () {
+      $('hist').disabled = true; $('hist-stop').hidden = false;
+      try { status(((await historie($('hist-van').value)) || '').split('\n').slice(-3).join(' · ')); }
+      catch (e) { status(e.message); } finally { $('hist').disabled = false; $('hist-stop').hidden = true; }
+    };
+    $('hist-stop').onclick = function () { historieStop = true; status('Stoppen na de huidige dag…'); };
+    $('log').textContent = log.join('\n') || 'Nog geen activiteit.';
+  }
+  var renderBezig = false;
+  async function render() {
+    if (!opened || !shadow || renderBezig) return;
+    renderBezig = true;
+    try {
+      var c = cfg(), id = klant();
+      $('pill-auto').textContent = haNeemtOver(c) ? 'Home Assistant verstuurt' : c.auto ? 'automatisch' : 'handmatig';
+      $('ha-state').textContent = haStatus.gecontroleerd ? (haStatus.at ? 'Laatste Home Assistant-heartbeat: ' + new Date(haStatus.at).toLocaleString('nl-NL', { timeZone: TZ, day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) + (haStatus.actief ? ' — HA is actief, de browser verstuurt niets.' : ' — te oud, de browser verstuurt zelf.') : 'Geen Home Assistant-integratie gezien; de browser verstuurt zelf.') : 'Nog niet gecontroleerd.';
+      $('pill-proef').textContent = c.proef ? 'proefstand' : ''; $('pill-proef').hidden = !c.proef;
+      $('key-state').textContent = heeftSleutel ? 'Sleutel ingesteld (staat in de userscript-opslag, niet in de pagina).' : 'Nog geen sleutel. Je vindt hem op je Mijnbatterij-profielpagina.';
+      $('nu').textContent = c.proef ? 'Nu valideren (proef)' : 'Nu delen';
+      if (!id) { $('tiles').innerHTML = '<p class="muted">Nog geen installatie herkend. Open eerst een dashboardpagina.</p>'; return; }
+      var r = await dagUitCache(id, vandaag(), Date.now(), c), w = r.w;
+      $('tiles').innerHTML =
+        '<div class="tile"><small>Totaal</small><strong class="' + cls(w.totaal) + '">' + euro(w.totaal) + '</strong></div>' +
+        '<div class="tile"><small>Handel</small><strong class="' + cls(w.handel) + '">' + euro(w.handel) + '</strong></div>' +
+        '<div class="tile"><small>Besparing</small><strong class="' + cls(w.besparing) + '">' + euro(w.besparing) + '</strong></div>' +
+        '<div class="tile"><small>Accudekking</small><strong>' + pct(r.dekking) + '</strong><div class="sub">' + kwhT(w.geladen) + ' in · ' + kwhT(w.ontladen) + ' uit</div></div>';
+      $('live-info').textContent = (laatsteLive ? 'live ' + (laatsteLive.p.test ? 'gevalideerd ' : 'verstuurd ') + klok(laatsteLive.at) : 'nog niet live verstuurd') +
+        (laatsteVerzameling ? ' · metingen ' + klok(laatsteVerzameling) : '') + (w.zonderPrijs ? ' · ' + w.zonderPrijs + ' kwartieren zonder prijs' : '');
+      var rijen = [];
+      for (var i = 1; i <= DAG_VENSTER; i++) {
+        var dk = plusDagen(vandaag(), -i), d = null, def = await lees(k(id, 'def:' + dk));
+        try {
+          if (def && def.v === 2 && def.kw) {
+            var dd = verdeelDefinitief(def.kw, await cacheKwartieren(id, dk));
+            var defRij = null; try { defRij = JSON.parse(def.sig); } catch (e) {}
+            d = { bron: 'BE', dekking: 1, w: waardeer(kiesPrijzen(dd.kw, def.kw, await prijsIndex(id), defRij), c, c.afrr ? afrrVan(defRij) : null) };
+          } else d = await dagUitCache(id, dk, null, c);
+        } catch (e) { d = null; }
+        var st = await lees(k(id, (c.proef ? 'proef:' : 'sent:') + dk));
+        var leeg = !d || (!d.w.accuSec && d.bron !== 'BE');
+        var opg = mbOpgeslagen[dk], mbCel = '<span class="muted">—</span>', toon = null;
+        if (st && st.payload) { toon = JSON.parse(JSON.stringify(st.payload)); if (Array.isArray(toon.intervals) && toon.intervals.length > 3) toon.intervals = toon.intervals.slice(0, 3).concat(['… ' + (st.payload.intervals.length - 3) + ' kwartieren meer']); }
+        if (opg) {
+          // De dag-GET kent geen batterySavings; controle op totaal en kWh.
+          var mt = num(opg.batteryResult), ml = num(opg.batteryCharged), mo = num(opg.batteryDischarged), gp = st && st.payload, gelijk = gp ?
+            Math.abs((mt || 0) - Number(gp.batteryResult)) < 0.011 && (ml === null || Math.abs(ml - Number(gp.chargedToday)) < 0.05) && (mo === null || Math.abs(mo - Number(gp.dischargedToday)) < 0.05) : null;
+          mbCel = '<span class="' + (gelijk === true ? 'ok' : gelijk === false ? 'afw' : '') + '">' + (gelijk === true ? '✓ ' : gelijk === false ? '⚠ ' : '') + euro(mt) + '</span>' +
+            ' <small class="muted">' + (ml !== null ? ml.toLocaleString('nl-NL', { maximumFractionDigits: 1 }) + '↑ ' : '') + (mo !== null ? mo.toLocaleString('nl-NL', { maximumFractionDigits: 1 }) + '↓' : '') + (opg.type ? ' · ' + esc(opg.type) : '') + ((leesLabel(opg.note) || {}).bron ? ' · ' + esc(leesLabel(opg.note).bron) : '') + '</small>';
+        } else if (mbOpgehaald) mbCel = '<span class="muted">niet aanwezig</span>';
+        var topTekst = d && d.w && d.w.top ? d.w.top.map(function (x) { return klok(x.q) + '  € ' + x.eur.toFixed(2) + '  · huis ' + x.ontHuis.toFixed(2) + ' / net ' + x.ontNet.toFixed(2) + ' uit, net ' + x.ladNet.toFixed(2) + ' / zon ' + x.ladPV.toFixed(2) + ' in kWh · afname € ' + (getal(x.pIn) ? x.pIn.toFixed(3) : '—') + ', teruglevering € ' + (getal(x.pUit) ? x.pUit.toFixed(3) : '—') + (x.bron ? ' (' + x.bron + ')' : ''); }).join('\n') : '';
+        rijen.push('<tr class="dag" data-top="' + esc(topTekst) + '" data-payload="' + esc(toon ? JSON.stringify(toon, null, 2) : '') + '" data-mb="' + esc(opg ? JSON.stringify(opg, null, 2) : '') + '"><td>' + esc(fmtDatum.format(new Date(dk + 'T12:00:00Z'))) + '</td><td>' + (leeg ? '<span class="muted">geen data</span>' : '<span class="tag ' + (d.bron === 'BE' ? 'be">BE definitief' : 'cache">cache') + '</span>') + '</td>' +
+          '<td>' + (leeg ? '—' : pct(d.dekking)) + '</td><td class="' + (leeg ? '' : cls(d.w.handel)) + '">' + (leeg ? '—' : euro(d.w.handel)) + '</td>' +
+          '<td class="' + (leeg ? '' : cls(d.w.besparing)) + '">' + (leeg ? '—' : euro(d.w.besparing)) + '</td><td class="' + (leeg ? '' : cls(d.w.totaal)) + '"><strong>' + (leeg ? '—' : euro(d.w.totaal)) + '</strong></td>' +
+          '<td>' + (leeg ? '—' : kwhT(d.w.geladen)) + '</td><td>' + (leeg ? '—' : kwhT(d.w.ontladen)) + '</td>' +
+          '<td>' + (st ? esc((c.proef ? 'getest ' : '') + st.bron + ' · ' + new Date(st.at).toLocaleString('nl-NL', { timeZone: TZ, day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })) : '<span class="muted">—</span>') + '</td><td>' + mbCel + '</td></tr>');
+      }
+      $('dagen').innerHTML = rijen.join('');
+      var mr = Object.keys(mbMaanden).sort().map(function (ym) { var m = mbMaanden[ym];
+        return ym + ' op Mijnbatterij: totaal ' + euro(num(m.batteryResult)) + ' · besparing ' + euro(num(m.batterySavings)) + ' · handel (afgeleid) ' + euro((num(m.batteryResult) || 0) - (num(m.batterySavings) || 0) - (num(m.batteryResultCongestion) || 0)) +
+          (num(m.batteryResultFixed) !== null ? ' · fixed ' + euro(num(m.batteryResultFixed)) : '') + (m.partial ? ' · deelresultaat' : ''); });
+      $('maand-mb').textContent = mr.join('\n');
+      $('log').textContent = log.join('\n') || 'Nog geen activiteit.';
+    } catch (e) { status(e.message); }
+    finally { renderBezig = false; }
+  }
+  function mobielToggle() { return document.querySelector('[data-bs-target="#mobileSidebar"]'); }
+  function layout() {
+    if (!root || !opened) return;
+    if (innerWidth >= 768) {
+      var anchor = navLinks.find(function (a) { var r = a.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.left < innerWidth; });
+      var c = anchor && anchor.closest('nav,aside,.sidebar,.sidenav,#sidebar,.offcanvas,.nav'), left = 0;
+      while (c && c !== document.body) { var r = c.getBoundingClientRect(); if (r.width > 80 && r.width < 440 && r.height > 180 && r.left < 120 && r.right < innerWidth * 0.6) left = Math.max(left, r.right); c = c.parentElement; }
+      root.style.left = Math.round(left) + 'px'; root.style.top = '0px';
+    } else {
+      var t = mobielToggle(), h = t && t.closest('header,nav,.navbar');
+      root.style.left = '0px'; root.style.top = Math.max(0, Math.round(h ? h.getBoundingClientRect().bottom : 0)) + 'px';
+    }
+  }
+  function markeer(aan) {
+    if (aan) {
+      activeBefore = Array.from(document.querySelectorAll('a.active')).filter(function (a) { return navLinks.indexOf(a) < 0 && a.closest('nav,aside,.sidebar,.sidenav,#sidebar,#mobileSidebar,.nav'); })
+        .map(function (a) { var o = a.className; a.className = o.replace(/\bactive\b/g, '').trim(); return [a, o]; });
+      navLinks.forEach(function (a) { a.classList.add('active'); a.setAttribute('aria-current', 'page'); });
+    } else {
+      navLinks.forEach(function (a) { a.classList.remove('active'); a.removeAttribute('aria-current'); });
+      activeBefore.forEach(function (p) { if (p[0].isConnected) p[0].className = p[1]; }); activeBefore = [];
+    }
+  }
+  function open(push) {
+    mount();
+    var t = document.querySelector('[data-bs-target="#mobileSidebar"][aria-expanded="true"]');
+    if (innerWidth < 768 && t) t.click();
+    if (push && location.hash !== HASH) history.pushState({ bemb: true }, '', location.pathname + location.search + HASH);
+    if (opened) { layout(); return; }
+    opened = true; root.hidden = false; thema(); layout(); markeer(true);
+    if (innerWidth < 768) window.scrollTo(0, 0);
+    render(); sleutelStatus().then(render);
+  }
+  function close() {
+    if (!opened) return;
+    opened = false; root.hidden = true; markeer(false);
+    if (location.hash === HASH) history.replaceState(history.state, '', location.pathname + location.search);
+  }
+  var ICON = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><rect x="3" y="7" width="16" height="10" rx="2"/><path d="M21 10.5v3"/><path d="M11.5 9 9 12.5h3.5L10 15"/></svg>';
+  function addMenu() {
+    navLinks = navLinks.filter(function (a) { return a.isConnected; });
+    var ankers = Array.from(document.querySelectorAll('a[href*="/results"]')).filter(function (a) { return !a.hasAttribute('data-bemb-link') && !a.closest('#bemb-root,#be-energieoverzicht'); });
+    ankers.forEach(function (anker) {
+      var lijst = anker.closest('ul,ol,nav,aside,.sidebar,.sidenav,#sidebar,#mobileSidebar,.nav') || anker.parentElement;
+      if (navLinks.some(function (a) { return lijst.contains(a); })) return;
+      var basis = anker.className.split(/\s+/).filter(function (x) { return x && x !== 'active'; })[0];
+      var link = document.createElement('a');
+      link.id = 'bemb-link' + (menuSerial ? '-' + menuSerial : ''); menuSerial++;
+      link.href = HASH; link.setAttribute('data-bemb-link', '');
+      link.className = anker.className.replace(/\bactive\b/g, '').trim();
+      link.innerHTML = ICON + '<span>Mijnbatterij</span>';
+      var icoon = anker.querySelector('svg'), eigen = link.querySelector('svg');
+      if (icoon) { eigen.setAttribute('class', icoon.getAttribute('class') || ''); eigen.setAttribute('width', icoon.getAttribute('width') || '24'); eigen.setAttribute('height', icoon.getAttribute('height') || '24'); }
+      link.style.cssText = 'display:flex;align-items:center;gap:12px;white-space:normal';
+      link.title = 'Accuresultaat delen met mijnbatterij.nl (handel en besparing)';
+      link.addEventListener('click', function (e) { e.preventDefault(); open(true); });
+      // Onderaan het menu: na het laatste item met dezelfde linkklasse.
+      var li = anker.parentElement && anker.parentElement.tagName === 'LI' ? anker.parentElement : null;
+      if (li && li.parentElement) {
+        var items = Array.from(li.parentElement.children).filter(function (x) { var a = x.querySelector('a'); return a && (!basis || a.classList.contains(basis)); });
+        var laatste = items[items.length - 1] || li, nieuw = document.createElement('li');
+        nieuw.className = li.className.replace(/\bactive\b/g, '').trim(); nieuw.appendChild(link);
+        laatste.insertAdjacentElement('afterend', nieuw);
+      } else {
+        var broers = Array.from(anker.parentElement.children).filter(function (x) { return x.tagName === 'A' && (!basis || x.classList.contains(basis)); });
+        (broers[broers.length - 1] || anker).insertAdjacentElement('afterend', link);
+      }
+      navLinks.push(link);
+      if (opened) { link.classList.add('active'); link.setAttribute('aria-current', 'page'); }
+    });
+  }
+  function onderhoud() {
+    addMenu();
+    if (location.hash === HASH && !opened) open(false);
+    else if (location.hash !== HASH && opened) close();
+    if (opened) layout();
+  }
+  // Andere menulinks sluiten deze pagina; hun eigen navigatie gaat gewoon door.
+  document.addEventListener('click', function (e) {
+    var a = e.target.closest && e.target.closest('a[href]');
+    if (opened && a && navLinks.indexOf(a) < 0 && !(root && root.contains(a)) && a.getAttribute('href') !== HASH) close();
+  }, true);
+  window.addEventListener('hashchange', onderhoud); window.addEventListener('popstate', onderhoud);
+  window.addEventListener('resize', function () { clearTimeout(layout.t); layout.t = setTimeout(layout, 60); });
+  document.addEventListener('be-dark-change', thema);
+  new MutationObserver(thema).observe(document.documentElement, { attributes: true, attributeFilter: ['data-be-dark'] });
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) tik(); });
+  setInterval(onderhoud, 1500); onderhoud();
+  sleutelStatus().then(function () { setTimeout(tik, 4000); });
+  setInterval(tik, 120000);
+}
+
+(function () {
+  'use strict';
+  function launch() {
+    var s = document.createElement('script');
+    s.textContent = '(' + bembPage.toString() + ')();';
+    document.documentElement.appendChild(s); s.remove();
+  }
+  if (document.body) launch(); else document.addEventListener('DOMContentLoaded', launch, { once: true });
+})();

@@ -1,0 +1,7 @@
+historie_herstellen:
+  fields:
+    vanaf:
+      required: true
+      example: "2026-08"
+      selector:
+        text:

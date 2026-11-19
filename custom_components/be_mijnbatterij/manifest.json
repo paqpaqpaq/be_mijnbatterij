@@ -1,0 +1,12 @@
+{
+  "domain": "be_mijnbatterij",
+  "name": "BE Mijnbatterij",
+  "codeowners": ["@paqpaqpaq"],
+  "config_flow": true,
+  "documentation": "https://github.com/paqpaqpaq/be_mijnbatterij",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/paqpaqpaq/be_mijnbatterij/issues",
+  "requirements": [],
+  "version": "1.1.0"
+}

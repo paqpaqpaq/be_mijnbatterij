@@ -1,0 +1,99 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Balans Energie → Mijnbatterij",
+        "description": "Inloggegevens van het Balans Energie-klantdashboard en je Mijnbatterij API-sleutel (profielpagina op mijnbatterij.nl). Proefstand staat standaard aan: er wordt dan alleen gevalideerd, niets opgeslagen.",
+        "data": {
+          "be_username": "BE gebruikersnaam (e-mail)",
+          "be_password": "BE wachtwoord",
+          "mb_api_key": "Mijnbatterij API-sleutel"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Opnieuw inloggen",
+        "data": {
+          "be_username": "BE gebruikersnaam (e-mail)",
+          "be_password": "BE wachtwoord",
+          "mb_api_key": "Mijnbatterij API-sleutel"
+        }
+      }
+    },
+    "error": {
+      "be_auth": "Inloggen bij Balans Energie mislukt: controleer gebruikersnaam en wachtwoord.",
+      "mb_auth": "Mijnbatterij weigert de API-sleutel.",
+      "cannot_connect": "Geen verbinding met Balans Energie of Mijnbatterij."
+    },
+    "abort": {
+      "already_configured": "Deze installatie is al gekoppeld.",
+      "reauth_successful": "Opnieuw ingelogd."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Instellingen",
+        "data": {
+          "versturen": "Versturen naar Mijnbatterij",
+          "proef": "Proefstand (test: true, niets opslaan)",
+          "saldeert": "EB op teruglevering (t/m 2026)",
+          "afrr": "aFRR-vergoedingen meetellen als handel"
+        },
+        "data_description": {
+          "versturen": "Uit: alleen meten en tonen.",
+          "proef": "Zolang dit aan staat, neemt de browserplugin niets over van Home Assistant.",
+          "saldeert": "Vanaf 2027 altijd zonder.",
+          "afrr": "Alleen bij definitieve BE-dagen bekend."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "totaal": {
+        "name": "Resultaat vandaag"
+      },
+      "handel": {
+        "name": "Handel vandaag"
+      },
+      "besparing": {
+        "name": "Besparing vandaag"
+      },
+      "geladen": {
+        "name": "Geladen vandaag"
+      },
+      "ontladen": {
+        "name": "Ontladen vandaag"
+      },
+      "dekking": {
+        "name": "Meetdekking vandaag"
+      },
+      "soc": {
+        "name": "Accu SOC"
+      },
+      "laatste_live": {
+        "name": "Laatst live verstuurd"
+      },
+      "status": {
+        "name": "Status"
+      }
+    },
+    "button": {
+      "nu_versturen": {
+        "name": "Nu versturen"
+      }
+    }
+  },
+  "services": {
+    "historie_herstellen": {
+      "name": "Historie herstellen",
+      "description": "Stuurt alle BE-definitieve dagen vanaf een maand opnieuw naar Mijnbatterij en vervangt maandtotalen van volledige maanden.",
+      "fields": {
+        "vanaf": {
+          "name": "Vanaf maand",
+          "description": "Formaat JJJJ-MM"
+        }
+      }
+    }
+  }
+}
