@@ -41,6 +41,7 @@ De **proefstand** staat standaard aan. Alles gaat dan met `test: true` naar Mijn
 - **Besparing** = ontladen naar huis × afnameprijs − het deel van de laadkosten dat daarbij hoort.
 - **Handel** = ontladen naar net × terugleverprijs − de overige laadkosten + aFRR-vergoedingen.
 - **batteryResult** = handel + besparing. Mijnbatterij leidt de handel daaruit af.
+- **Omvormerrendement:** BE meet het accuvermogen aan de DC-kant. Gewaardeerd wordt de AC-kant: ontladen levert DC × η-uit, laden kost DC ÷ η-in. η wordt per installatie en per vermogensklasse gemeten op momenten zonder PV, want dan geldt exact: accu AC = verbruik − net. Gemeten op 19-11-2026: ontladen 0,88–0,95, laden 0,96 (rondgang ≈ 0,87). De geladen en ontladen kWh richting Mijnbatterij blijven de DC-waarden, zoals BE ze rapporteert.
 - **All-in prijs:** kale BE-prijs × 1,21 ± € 0,02 opslag, plus energiebelasting op afname. Tot en met 2026 komt de EB ook terug op teruglevering (saldering).
 - **Prijs per kwartier:** de effectieve kwartierprijs van BE, als die betrouwbaar is (minstens 0,05 kWh netstroom en hooguit € 1,50/kWh kaal). Anders de vastgelegde marktprijs (onbalans, aFRR of day-ahead). Alleen als laatste redmiddel het daggemiddelde; een dag met meer dan 2 uur daggemiddelde gaat als `invalid` mee.
 

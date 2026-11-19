@@ -50,7 +50,7 @@ SENSOREN = (
                            entity_category=EntityCategory.DIAGNOSTIC,
                            waarde=lambda d: datetime.fromtimestamp(d["laatste_live"], timezone.utc) if d["laatste_live"] else None),
     BEMBSensorBeschrijving(key="status", translation_key="status", entity_category=EntityCategory.DIAGNOSTIC,
-                           waarde=lambda d: d["status"][:250], extra=lambda d: {"activiteit": d["log"], "dagen": d["dagen"]}),
+                           waarde=lambda d: d["status"][:250], extra=lambda d: {"activiteit": d["log"], "dagen": d["dagen"], "omvormerrendement": d.get("rendement")}),
 )
 
 

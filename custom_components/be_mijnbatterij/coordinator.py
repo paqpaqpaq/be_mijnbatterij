@@ -98,4 +98,5 @@ class BEMBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "laatste_live": e.laatste_live["at"] / 1000 if e and e.laatste_live else None,
             "status": self.fout or ("proefstand" if e and e.proef else "actief" if e and e.versturen else "alleen meten"),
             "log": (e.log[:15] if e else []), "dagen": dagen, "kwartieren": len(top),
+            "rendement": e.eta if e else None,
         }

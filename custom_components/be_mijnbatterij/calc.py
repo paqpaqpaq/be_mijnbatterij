@@ -100,15 +100,84 @@ def verdeel(po: float, bo: float) -> dict[str, float]:
     return {"ontHuis": ont_huis, "ontNet": ont - ont_huis, "ladPV": lad_pv, "ladNet": lad - lad_pv}
 
 
+# ── Omvormerrendement ───────────────────────────────────────────────────
+# BE's accuvermogen (bo) is DC. Gewaardeerd wordt de AC-kant: ontladen AC =
+# DC × η_uit, laden AC = DC / η_in. η per installatie gemeten op momenten
+# zonder PV (p, g ≈ 0), waar accu AC = huis − net exact is.
+ETA_STANDAARD = {"uit": [0.945, 0.945, 0.881], "in": [0.957, 0.957, 0.957]}
+
+
+def eta_klasse(w: float, laden: bool) -> int:
+    a = abs(w)
+    if laden:
+        return 0 if a < 3000 else 1 if a < 7000 else 2
+    return 0 if a < 2000 else 1 if a < 5000 else 2
+
+
+def naar_ac(bo: float, e: dict | None = None) -> float:
+    e = e or ETA_STANDAARD
+    if bo > 0:
+        return bo * e["uit"][eta_klasse(bo, False)]
+    if bo < 0:
+        return bo / e["in"][eta_klasse(bo, True)]
+    return 0.0
+
+
+def kalibratie_leeg() -> dict:
+    return {"uit": [[0.0, 0.0, 0] for _ in range(3)], "in": [[0.0, 0.0, 0] for _ in range(3)]}
+
+
+def kalibratie_tel(som: dict, r: dict) -> None:
+    """Tel één meting mee (alleen zonder PV en bij > 800 W accuvermogen)."""
+    if not all(getal(r.get(f)) for f in ("po", "bo", "l", "p", "g")) or r["p"] >= 15 or r["g"] >= 15 or abs(r["bo"]) <= 800:
+        return
+    laden = r["bo"] < 0
+    cel = som["in" if laden else "uit"][eta_klasse(r["bo"], laden)]
+    if laden:
+        cel[0] += -r["bo"]; cel[1] += r["po"] - r["l"]
+    else:
+        cel[0] += r["l"] - r["po"]; cel[1] += r["bo"]
+    cel[2] += 1
+
+
+def kalibratie_eta(som: dict) -> dict:
+    """Klasse vanaf 50 metingen, anders richtingsgemiddelde vanaf 100, anders standaard."""
+    uit: dict = {}
+    for naam in ("uit", "in"):
+        t0 = sum(c[0] for c in som[naam]); t1 = sum(c[1] for c in som[naam]); tn = sum(c[2] for c in som[naam])
+        totaal = t0 / t1 if tn >= 100 and t1 > 0 else None
+        waarden = []
+        for i, c in enumerate(som[naam]):
+            v = c[0] / c[1] if c[2] >= 50 and c[1] > 0 else totaal
+            waarden.append(round(v * 1000) / 1000 if v is not None and 0.8 <= v <= 0.99 else ETA_STANDAARD[naam][i])
+        uit[naam] = waarden
+    uit["n"] = {naam: [c[2] for c in som[naam]] for naam in ("uit", "in")}
+    return uit
+
+
+def kalibreer(rows: list[dict]) -> dict:
+    som = kalibratie_leeg()
+    for r in rows or []:
+        if isinstance(r, dict):
+            kalibratie_tel(som, r)
+    return kalibratie_eta(som)
+
+
+def eta_tekst(e: dict) -> str:
+    return ("Omvormerrendement uit " + "/".join(to_fixed(x, 2) for x in e["uit"])
+            + ", in " + "/".join(to_fixed(x, 2) for x in e["in"]))
+
+
 def gat_grens(res_ms: float | None) -> float:
     return max(120_000, min(round((res_ms or 0) * 1.5), 600_000))
 
 
 def leeg_kwartier() -> dict[str, float]:
-    return {"imp": 0.0, "exp": 0.0, "dek": 0.0, "ontHuis": 0.0, "ontNet": 0.0, "ladNet": 0.0, "ladPV": 0.0, "accuSec": 0.0}
+    return {"imp": 0.0, "exp": 0.0, "dek": 0.0, "ontHuis": 0.0, "ontNet": 0.0, "ladNet": 0.0, "ladPV": 0.0, "accuSec": 0.0,
+            "geladen": 0.0, "ontladen": 0.0}
 
 
-def integreer_segment(kw: dict[int, dict], r: dict, n: dict) -> None:
+def integreer_segment(kw: dict[int, dict], r: dict, n: dict, e: dict | None = None) -> None:
     """Tel het segment r → n tijdgewogen bij in de kwartieren (gaten nooit opvullen)."""
     dt = n["t"] - r["t"]
     if dt <= 0 or dt > gat_grens(r.get("r")):
@@ -125,9 +194,12 @@ def integreer_segment(kw: dict[int, dict], r: dict, n: dict) -> None:
             c["exp"] += -r["po"] * uur / 1000
         c["dek"] += sec
         if getal(r.get("bo")):
-            v = verdeel(r["po"], r["bo"])
+            # Verdeling en waardering in AC; geladen/ontladen blijven de gemeten DC-kWh.
+            v = verdeel(r["po"], naar_ac(r["bo"], e))
             for f in FLOWS:
                 c[f] += v[f] * uur / 1000
+            c["geladen"] = c.get("geladen", 0.0) + max(-r["bo"], 0) * uur / 1000
+            c["ontladen"] = c.get("ontladen", 0.0) + max(r["bo"], 0) * uur / 1000
             c["accuSec"] += sec
         s = n.get("s")
         if getal(s) and 0 <= s <= 100 and stop == n["t"]:
@@ -135,11 +207,11 @@ def integreer_segment(kw: dict[int, dict], r: dict, n: dict) -> None:
         pos = stop
 
 
-def naar_kwartieren(rows: list[dict]) -> dict[int, dict]:
+def naar_kwartieren(rows: list[dict], e: dict | None = None) -> dict[int, dict]:
     s = sorted((r for r in rows if r and getal(r.get("t")) and getal(r.get("po"))), key=lambda r: r["t"])
     kw: dict[int, dict] = {}
     for i in range(len(s) - 1):
-        integreer_segment(kw, s[i], s[i + 1])
+        integreer_segment(kw, s[i], s[i + 1], e)
     return kw
 
 
@@ -384,7 +456,7 @@ def parse_definitief(j: dict, rij: dict | None, dk: str) -> dict[int, dict]:
     return out
 
 
-def verdeel_definitief(bron: dict[int, dict], cache: dict[int, dict] | None) -> dict:
+def verdeel_definitief(bron: dict[int, dict], cache: dict[int, dict] | None, e: dict | None = None) -> dict:
     uit, uit_cache, geschat, aangevuld, ontbrekend = {}, 0, 0, 0, 0
     cache = cache or {}
     for q, v in bron.items():
@@ -396,7 +468,9 @@ def verdeel_definitief(bron: dict[int, dict], cache: dict[int, dict] | None) -> 
             if c and c.get("accuSec", 0) >= 810:
                 for f in FLOWS:
                     m[f] = c[f]
-                m["geladen"], m["ontladen"], m["accuSec"] = c["ladNet"] + c["ladPV"], c["ontHuis"] + c["ontNet"], 900
+                m["geladen"] = c["geladen"] if getal(c.get("geladen")) else 0.0
+                m["ontladen"] = c["ontladen"] if getal(c.get("ontladen")) else 0.0
+                m["accuSec"] = 900
                 if getal(c.get("soc")):
                     m["soc"] = c["soc"]
                 aangevuld += 1
@@ -406,17 +480,20 @@ def verdeel_definitief(bron: dict[int, dict], cache: dict[int, dict] | None) -> 
             continue
         cl = (c["ladNet"] + c["ladPV"]) if c else 0
         co = (c["ontHuis"] + c["ontNet"]) if c else 0
+        # BE-kWh zijn DC; omrekenen naar AC met het rendement bij het kwartiergemiddelde vermogen.
+        lad_ac = -naar_ac(-v["laden"] * 4000, e) / 4000
+        ont_ac = naar_ac(v["ontladen"] * 4000, e) / 4000
         n = {"imp": v["imp"], "exp": v["exp"], "accuSec": 900, "geladen": v["laden"], "ontladen": v["ontladen"]}
         if c and getal(c.get("soc")):
             n["soc"] = c["soc"]
         if c and c.get("accuSec", 0) >= 810 and (cl > 0 or v["laden"] == 0) and (co > 0 or v["ontladen"] == 0):
-            n["ladPV"] = v["laden"] * c["ladPV"] / cl if cl else 0.0
-            n["ladNet"] = v["laden"] - n["ladPV"]
-            n["ontHuis"] = v["ontladen"] * c["ontHuis"] / co if co else 0.0
-            n["ontNet"] = v["ontladen"] - n["ontHuis"]
+            n["ladPV"] = lad_ac * c["ladPV"] / cl if cl else 0.0
+            n["ladNet"] = lad_ac - n["ladPV"]
+            n["ontHuis"] = ont_ac * c["ontHuis"] / co if co else 0.0
+            n["ontNet"] = ont_ac - n["ontHuis"]
             uit_cache += 1
         else:
-            netto = v["ontladen"] - v["laden"]
+            netto = ont_ac - lad_ac
             if abs(netto) < 1e-9:
                 netto = 0.0
             ont, lad, rest = max(netto, 0.0), max(-netto, 0.0), v["imp"] - v["exp"] + netto
@@ -476,7 +553,7 @@ def dag_payload(r: dict, saldeert: bool, afrr: bool, versie: str, bron_label: st
     note = (kop + (f". {w['geschattePrijs']} kwartieren met daggemiddelde prijs" if w.get("geschattePrijs") else "")
             + ". All-in" + (", EB op teruglevering t/m 2026" if saldeert else ", zonder EB op teruglevering")
             + ". Besparing = ontladen naar huis minus evenredige laadkosten; handel = ontladen naar net minus evenredige laadkosten"
-            + (" plus aFRR-vergoeding" if r["bron"] == "BE" and afrr else "") + ".")
+            + (" plus aFRR-vergoeding" if r["bron"] == "BE" and afrr else "") + ". " + eta_tekst(r.get("eta") or ETA_STANDAARD) + ".")
     label = maak_label(versie, bron_label, "be" if r["bron"] == "BE" else "cache", r["dekking"], actief)
     note = note[: 480 - len(label) - 1] + " " + label
     return {"date": r["dk"], "batteryResult": e2(w["totaal"]), "batterySavings": e2(w["besparing"]),

@@ -44,6 +44,7 @@ class Engine:
         self.s = state
         for key, leeg in (("kw", {}), ("prijzen", {}), ("def", {}), ("sent", {}), ("maand", {}), ("hersteld", {})):
             self.s.setdefault(key, leeg)
+        self.s.setdefault("eta_som", calc.kalibratie_leeg())
         self.log: list[str] = []
         self.laatste_live: dict | None = None
         self.laatste_dagronde = 0.0
@@ -75,6 +76,10 @@ class Engine:
     @property
     def versturen(self) -> bool:
         return bool(self.opties.get("versturen", True))
+
+    @property
+    def eta(self) -> dict:
+        return calc.kalibratie_eta(self.s["eta_som"])
 
     def kw_dag(self, dk: str) -> dict[int, dict]:
         return {int(q): dict(v) for q, v in (self.s["kw"].get(dk) or {}).items()}
@@ -108,6 +113,7 @@ class Engine:
                 n["bo"] = r["bo"]
             if calc.getal(r.get("s")):
                 n["s"] = r["s"]
+            calc.kalibratie_tel(self.s["eta_som"], r)
             if vorige:
                 # Bestaande kwartierwaarden worden aangevuld, niet vervangen.
                 for q in range((int(vorige["t"]) // calc.Q) * calc.Q, n["t"] + 1, calc.Q):
@@ -115,12 +121,17 @@ class Engine:
                         oud = (self.s["kw"].get(calc.dag_van(q)) or {}).get(str(q))
                         if oud:
                             nieuw[q] = dict(oud)
-                calc.integreer_segment(nieuw, vorige, n)
+                calc.integreer_segment(nieuw, vorige, n, self.eta)
             vorige = n
         for q, c in nieuw.items():
             self.s["kw"].setdefault(calc.dag_van(q), {})[str(q)] = c
         if vorige:
             self.s["laatste"] = vorige
+        # Kalibratie laten meebewegen: oude metingen wegen langzaam minder.
+        som = self.s["eta_som"]
+        if sum(c[2] for naam in ("uit", "in") for c in som[naam]) > 40_000:
+            for naam in ("uit", "in"):
+                som[naam] = [[c[0] / 2, c[1] / 2, c[2] // 2] for c in som[naam]]
         grens = calc.plus_dagen(calc.vandaag(nu), -KW_DAGEN)
         for dk in [d for d in self.s["kw"] if d < grens]:
             del self.s["kw"][dk]
@@ -178,7 +189,7 @@ class Engine:
         duur = max(1.0, (einde - start) / 1000)
         kw = {q: x for q, x in calc.zet_prijzen(self.kw_dag(dk), self.prijs_index()).items() if q < einde}
         w = calc.waardeer(kw, self.saldeert, None)
-        return {"dk": dk, "bron": "cache", "kw": kw, "w": w,
+        return {"dk": dk, "bron": "cache", "kw": kw, "w": w, "eta": self.eta,
                 "dekking": min(1.0, w["accuSec"] / duur), "prijsDekking": min(1.0, w["prijsSec"] / duur)}
 
     async def maand_bron(self, ym: str, ttl_s: float) -> dict:
@@ -215,14 +226,14 @@ class Engine:
 
     async def dag_definitief(self, dk: str, rij: dict, force: bool) -> dict:
         bron = await self.haal_definitief(dk, rij, force)
-        d = calc.verdeel_definitief(bron, self.kw_dag(dk))
+        d = calc.verdeel_definitief(bron, self.kw_dag(dk), self.eta)
         if d["ontbrekend"] > 4:
             raise calc.BronFout(f"{d['ontbrekend']} kwartieren zonder accuwaarden, ook niet in eigen metingen")
         kw = calc.kies_prijzen(d["kw"], bron, self.prijs_index(), rij)
         w = calc.waardeer(kw, self.saldeert, calc.afrr_van(rij) if self.afrr else None)
         start, eind = calc.grenzen(dk)
         duur = (eind - start) / 1000
-        return {"dk": dk, "bron": "BE", "kw": kw, "w": w, "dekking": min(1.0, w["accuSec"] / duur),
+        return {"dk": dk, "bron": "BE", "kw": kw, "w": w, "eta": self.eta, "dekking": min(1.0, w["accuSec"] / duur),
                 "prijsDekking": min(1.0, w["prijsSec"] / duur), "aangevuld": d["aangevuld"]}
 
     async def bepaal_dag(self, dk: str, maand_j: dict | None, force: bool, rapport: list[str]) -> dict | None:
