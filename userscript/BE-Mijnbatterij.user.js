@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BE Mijnbatterij
 // @namespace    paq.balansenergie
-// @version      1.2.0
+// @version      1.2.1
 // @description  Deelt accuresultaten van het Balans Energie-dashboard met mijnbatterij.nl, gesplitst in handel en besparing. Los van Balansenergie All-in; eigen pagina in het menu.
 // @homepageURL  https://github.com/paqpaqpaq/be_mijnbatterij
 // @updateURL    https://raw.githubusercontent.com/paqpaqpaq/be_mijnbatterij/main/userscript/BE-Mijnbatterij.user.js
@@ -71,17 +71,28 @@
       if (!key) { answer({ ok: false, error: 'Geen API-sleutel ingesteld' }); return; }
       var fn = gmx();
       if (!fn) { answer({ ok: false, error: 'GM_xmlhttpRequest ontbreekt' }); return; }
-      fn({
-        method: method, url: API + v.path, timeout: 25000,
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.2.0' },
-        data: v.body ? JSON.stringify(v.body) : undefined,
-        onload: function (r) {
-          var ok = r.status >= 200 && r.status < 300, text = String(r.responseText || '');
-          answer({ ok: ok, status: r.status, text: text.slice(0, 20000), error: ok ? '' : 'HTTP ' + r.status + ' — ' + text.slice(0, 300) });
-        },
-        onerror: function () { answer({ ok: false, error: 'Netwerkfout richting mijnbatterij.nl' }); },
-        ontimeout: function () { answer({ ok: false, error: 'Timeout richting mijnbatterij.nl' }); }
-      });
+      // Netwerkfouten (verbinding weggevallen, extensie even niet bereikbaar) één keer opnieuw proberen.
+      var poging = 0;
+      var stuur = function () {
+        poging++;
+        fn({
+          method: method, url: API + v.path, timeout: 25000,
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.2.1' },
+          data: v.body ? JSON.stringify(v.body) : undefined,
+          onload: function (r) {
+            var ok = r.status >= 200 && r.status < 300, text = String(r.responseText || '');
+            if (!r.status && poging < 2) { setTimeout(stuur, 3000); return; }
+            answer({ ok: ok, status: r.status, text: text.slice(0, 20000), error: ok ? '' : (r.status ? 'HTTP ' + r.status + ' — ' + text.slice(0, 300) : 'Geen antwoord van mijnbatterij.nl') });
+          },
+          onerror: function (r) {
+            if (poging < 2) { setTimeout(stuur, 3000); return; }
+            var d = r && (r.error || r.statusText || (r.status ? 'status ' + r.status : '')) || '';
+            answer({ ok: false, error: 'Netwerkfout richting mijnbatterij.nl' + (d ? ' (' + String(d).slice(0, 120) + ')' : '') });
+          },
+          ontimeout: function () { answer({ ok: false, error: 'Timeout richting mijnbatterij.nl' }); }
+        });
+      };
+      stuur();
     } catch (e) { answer({ ok: false, error: e && e.message || String(e) }); }
   });
 })();
@@ -92,7 +103,7 @@ function bembPage() {
   if (window.__bembLoaded) return;
   window.__bembLoaded = true;
 
-  var VERSIE = '1.2.0', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
+  var VERSIE = '1.2.1', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
   var BTW = 1.21, OPSLAG = 0.02;
   // Energiebelasting excl. btw, schijf 1. Saldering eindigt op 1-1-2027.
   var EB_EX = { 2025: 0.10154, 2026: 0.09161, 2027: 0.08802 };
@@ -1051,7 +1062,7 @@ function bembPage() {
         '<div class="tile"><small>Besparing</small><strong class="' + cls(w.besparing) + '">' + euro(w.besparing) + '</strong></div>' +
         '<div class="tile"><small>Accudekking</small><strong>' + pct(r.dekking) + '</strong><div class="sub">' + kwhT(w.geladen) + ' in · ' + kwhT(w.ontladen) + ' uit</div></div>';
       $('live-info').textContent = (laatsteLive ? 'live ' + (laatsteLive.p.test ? 'gevalideerd ' : 'verstuurd ') + klok(laatsteLive.at) : 'nog niet live verstuurd') +
-        (laatsteVerzameling ? ' · metingen ' + klok(laatsteVerzameling) : '') + (w.zonderPrijs ? ' · ' + w.zonderPrijs + ' kwartieren zonder prijs' : '') + ' · ' + etaTekst(ETA).toLowerCase() + (ETA.n ? ' (gemeten, n=' + (ETA.n.uit.reduce(function (a, b) { return a + b; }, 0) + ETA.n.in.reduce(function (a, b) { return a + b; }, 0)) + ')' : ' (standaard)');
+        (laatsteVerzameling ? ' · metingen ' + klok(laatsteVerzameling) : '') + (w.zonderPrijs ? ' · ' + w.zonderPrijs + ' kwartieren zonder prijs' : '') + ' · ' + etaTekst(ETA).toLowerCase() + (function () { var n = ETA.n ? ETA.n.uit.concat(ETA.n.in).reduce(function (a, b) { return a + b; }, 0) : 0; return n >= 100 ? ' (gemeten, n=' + n + ')' : ' (standaard' + (n ? ', ' + n + ' metingen, nog te weinig' : '') + ')'; })();
       var rijen = [];
       for (var i = 1; i <= DAG_VENSTER; i++) {
         var dk = plusDagen(vandaag(), -i), d = null, def = await lees(k(id, 'def:' + dk));
