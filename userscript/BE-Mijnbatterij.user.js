@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BE Mijnbatterij
 // @namespace    paq.balansenergie
-// @version      1.3.0
+// @version      1.4.0
 // @description  Deelt accuresultaten van het Balans Energie-dashboard met mijnbatterij.nl, gesplitst in handel en besparing. Los van Balansenergie All-in; eigen pagina in het menu.
 // @homepageURL  https://github.com/paqpaqpaq/be_mijnbatterij
 // @updateURL    https://raw.githubusercontent.com/paqpaqpaq/be_mijnbatterij/main/userscript/BE-Mijnbatterij.user.js
@@ -77,7 +77,7 @@
         poging++;
         fn({
           method: method, url: API + v.path, timeout: 25000,
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.3.0' },
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.4.0' },
           data: v.body ? JSON.stringify(v.body) : undefined,
           onload: function (r) {
             var ok = r.status >= 200 && r.status < 300, text = String(r.responseText || '');
@@ -103,7 +103,7 @@ function bembPage() {
   if (window.__bembLoaded) return;
   window.__bembLoaded = true;
 
-  var VERSIE = '1.3.0', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
+  var VERSIE = '1.4.0', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
   // Marge (procentpunt): twee verzenders met vrijwel volledige data mogen elkaar vervangen;
   // aanvullen naast HA gebeurt pas bij +1 pp, zodat ze niet pingpongen.
   var TOLERANTIE = 0.5;
@@ -204,9 +204,12 @@ function bembPage() {
       if (dt <= 0 || dt > gatGrens(r.r)) continue;
       for (var pos = r.t; pos < n.t;) {
         var q = Math.floor(pos / Q) * Q, stop = Math.min(n.t, q + Q), uur = (stop - pos) / 3600000, sec = (stop - pos) / 1000;
-        var c = kw[q] || (kw[q] = { imp: 0, exp: 0, dek: 0, ontHuis: 0, ontNet: 0, ladNet: 0, ladPV: 0, accuSec: 0, geladen: 0, ontladen: 0 });
+        var c = kw[q] || (kw[q] = { imp: 0, exp: 0, dek: 0, ontHuis: 0, ontNet: 0, ladNet: 0, ladPV: 0, accuSec: 0, geladen: 0, ontladen: 0, pv: 0, pvSec: 0, load: 0, loadSec: 0 });
         if (r.po > 0) c.imp += r.po * uur / 1000; else c.exp += -r.po * uur / 1000;
         c.dek += sec;
+        // Zon = PV op de Balans-omvormer (p) + PV bij het huis (g); huis = l. Gecontroleerd: l ≈ po + bo(AC) + p + g.
+        if (getal(r.p) || getal(r.g)) { c.pv += ((getal(r.p) ? r.p : 0) + (getal(r.g) ? r.g : 0)) * uur / 1000; c.pvSec += sec; }
+        if (getal(r.l)) { c.load += r.l * uur / 1000; c.loadSec += sec; }
         if (getal(r.bo)) {
           // Verdeling en waardering in AC; geladen/ontladen blijven de gemeten DC-kWh.
           var v = verdeel(r.po, naarAC(r.bo, e));
@@ -232,10 +235,19 @@ function bembPage() {
   // ontladen kWh; laadkosten worden naar rato van die kWh verdeeld.
   function waardeer(kw, c, afrrEur) {
     var t = { ontHuis: 0, ontNet: 0, ladNet: 0, ladPV: 0, huis: 0, net: 0, kNet: 0, kPV: 0, imp: 0, exp: 0,
-      geladen: 0, ontladen: 0, accuSec: 0, prijsSec: 0, vastSec: 0, onzeker: 0, zonderPrijs: 0, voorlopigePrijs: 0, kwartieren: 0 };
+      geladen: 0, ontladen: 0, accuSec: 0, prijsSec: 0, vastSec: 0, onzeker: 0, zonderPrijs: 0, voorlopigePrijs: 0, kwartieren: 0,
+      pv: 0, pvExport: 0, pvOnbekend: 0, impKost: 0, impMetPrijs: 0, expOpbr: 0, expMetPrijs: 0 };
     Object.keys(kw).forEach(function (k) {
       var x = kw[k], q = +k; t.kwartieren++;
       t.imp += x.imp || 0; t.exp += x.exp || 0;
+      // Zon: opgewekt, en wat daarvan naar het net ging (teruglevering die niet uit de accu kwam).
+      var pvK = getal(x.pv) && (!getal(x.pvSec) || x.pvSec >= 0.9 * (x.dek || 900)) ? x.pv : null;
+      if (pvK === null) t.pvOnbekend++;
+      else { t.pv += pvK; t.pvExport += Math.min(pvK, Math.max((x.exp || 0) - (x.ontNet || 0), 0)); }
+      // Gemiddelde all-in in- en verkoopprijs van het huishouden (gewogen naar afname/teruglevering).
+      var piH = getal(x.pIn) ? allin(x.pIn, false, q, c) : null, peH = getal(x.pUit) ? allin(x.pUit, true, q, c) : null;
+      if (getal(piH) && x.imp > 0) { t.impKost += piH * x.imp; t.impMetPrijs += x.imp; }
+      if (getal(peH) && x.exp > 0) { t.expOpbr += peH * x.exp; t.expMetPrijs += x.exp; }
       if (!(x.accuSec > 0)) return;
       var sec = Math.min(900, x.accuSec); t.accuSec += sec;
       t.geladen += getal(x.geladen) ? x.geladen : x.ladNet + x.ladPV;
@@ -274,7 +286,7 @@ function bembPage() {
       var v = bron[q], c = cache && cache[q];
       // BE-kwartier zonder accuwaarden: aanvullen uit eigen metingen, anders als ongemeten tellen.
       if (v.leeg) {
-        var m = { imp: v.imp, exp: v.exp, accuSec: 0, ladNet: 0, ladPV: 0, ontHuis: 0, ontNet: 0, geladen: 0, ontladen: 0 };
+        var m = { imp: v.imp, exp: v.exp, accuSec: 0, ladNet: 0, ladPV: 0, ontHuis: 0, ontNet: 0, geladen: 0, ontladen: 0, pv: v.pv, load: v.load };
         if (c && c.accuSec >= 810) {
           ['ladNet', 'ladPV', 'ontHuis', 'ontNet'].forEach(function (f) { m[f] = c[f]; });
           m.geladen = getal(c.geladen) ? c.geladen : 0; m.ontladen = getal(c.ontladen) ? c.ontladen : 0; m.accuSec = 900; m.soc = c.soc; aangevuld++;
@@ -284,16 +296,25 @@ function bembPage() {
       var cl = c ? c.ladNet + c.ladPV : 0, co = c ? c.ontHuis + c.ontNet : 0;
       // BE-kWh zijn DC; omrekenen naar AC met het rendement bij het kwartiergemiddelde vermogen.
       var ladAC = -naarAC(-v.laden * 4000, e) / 4000, ontAC = naarAC(v.ontladen * 4000, e) / 4000;
-      var n = { imp: v.imp, exp: v.exp, accuSec: 900, geladen: v.laden, ontladen: v.ontladen, soc: c && c.soc };
+      var n = { imp: v.imp, exp: v.exp, accuSec: 900, geladen: v.laden, ontladen: v.ontladen, soc: c && c.soc, pv: v.pv, load: v.load };
       if (c && c.accuSec >= 810 && (cl > 0 || v.laden === 0) && (co > 0 || v.ontladen === 0)) {
         n.ladPV = cl ? ladAC * c.ladPV / cl : 0; n.ladNet = ladAC - n.ladPV;
         n.ontHuis = co ? ontAC * c.ontHuis / co : 0; n.ontNet = ontAC - n.ontHuis; uitCache++;
+        if (!getal(n.pv) && c.pvSec >= 810) n.pv = c.pv;
+      } else if (v.laden > 0 && v.ontladen > 0 && getal(v.load) && getal(v.pv)) {
+        // Laden én ontladen in één kwartier: volgorde onbekend. Verdeel met BE's huisverbruik en zon:
+        // ontladen dekt eerst de huisvraag na zon, laden komt eerst uit het zonne-overschot.
+        var vraag = Math.max(v.load - v.pv, 0), over = Math.max(v.pv - v.load, 0);
+        n.ontHuis = Math.min(ontAC, vraag); n.ontNet = ontAC - n.ontHuis;
+        n.ladPV = Math.min(ladAC, over); n.ladNet = ladAC - n.ladPV; geschat++; geschatActief++;
       } else {
+        // Eén richting in het kwartier: uit de netstromen volgt de verdeling exact (op kwartierniveau).
         var netto = ontAC - ladAC; if (Math.abs(netto) < 1e-9) netto = 0;
         var ont = Math.max(netto, 0), lad = Math.max(-netto, 0), rest = v.imp - v.exp + netto;
         n.ladPV = Math.min(lad, Math.max(-rest, 0)); n.ladNet = lad - n.ladPV;
         n.ontHuis = Math.min(ont, Math.max(rest, 0)); n.ontNet = ont - n.ontHuis; geschat++;
-        if (v.laden > 0 || v.ontladen > 0) geschatActief++;
+        // Onzeker alleen als er in hetzelfde kwartier ook laden+ontladen of afname+teruglevering was.
+        if ((v.laden > 0 && v.ontladen > 0) || ((v.laden > 0 || v.ontladen > 0) && v.imp > 0.02 && v.exp > 0.02)) geschatActief++;
       }
       uit[q] = n;
     });
@@ -324,7 +345,7 @@ function bembPage() {
       onbekend: function (s) { return w.some(function (x) { return s >= x[0] && s < x[1]; }); } };
   }
 
-  if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger, vulOnbalans: vulOnbalans, tenergyAanvullen: tenergyAanvullen, prijsKeuze: prijsKeuze, zetActief: zetActief, tenergyVast: tenergyVast, zetPrijzen: zetPrijzen }; return; }
+  if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger, vulOnbalans: vulOnbalans, tenergyAanvullen: tenergyAanvullen, prijsKeuze: prijsKeuze, zetActief: zetActief, tenergyVast: tenergyVast, zetPrijzen: zetPrijzen, parseDefinitief: parseDefinitief, marktPrijs: marktPrijs, extraVelden: extraVelden, dagPayload: dagPayload }; return; }
 
   /* ── Installatie en instellingen ── */
   function geldig(id) { return !!id && /^[A-Za-z0-9_-]+$/.test(id) && !/^(?:account|results|current-history|current-prices|undefined|null)$/i.test(id); }
@@ -703,27 +724,39 @@ function bembPage() {
       var leeg = !getal(v.battery_charged_kwh) || !getal(v.battery_discharged_kwh);
       if (leeg) leegAccu++;
       laden += bl; ontladen += bo;
+      // Settlementprijs per kwartier uit market_breakdown (per markt, onafhankelijk van het volume);
+      // de effectieve prijs (kosten/kWh) blijft de reserve.
+      var mb = v.market_breakdown && v.market_breakdown.available ? v.market_breakdown : null;
       out[q] = { imp: v.grid_import_kwh, exp: v.grid_export_kwh, laden: bl, ontladen: bo, leeg: leeg,
         pIn: getal(v.effective_import_price_eur_per_kwh) ? v.effective_import_price_eur_per_kwh : null,
-        pUit: getal(v.effective_export_price_eur_per_kwh) ? v.effective_export_price_eur_per_kwh : null };
+        pUit: getal(v.effective_export_price_eur_per_kwh) ? v.effective_export_price_eur_per_kwh : null,
+        mIn: mb ? marktPrijs(mb.purchases) : null, mUit: mb ? marktPrijs(mb.sales) : null,
+        pv: getal(v.solar_direct_kwh) && v.solar_direct_kwh >= 0 ? v.solar_direct_kwh : null,
+        load: getal(v.load_kwh) && v.load_kwh >= 0 ? v.load_kwh : null };
     });
     if (Object.keys(out).length !== (g.eind - g.start) / Q) throw Error('Kwartieren dekken niet de hele dag');
     if (rij && getal(rij.battery_charged_kwh) && getal(rij.battery_discharged_kwh) &&
       (Math.abs(laden - rij.battery_charged_kwh) > 0.15 || Math.abs(ontladen - rij.battery_discharged_kwh) > 0.15)) throw Error('Kwartieren sluiten niet aan op dagtotaal');
     return out;
   }
+  // Volumegewogen prijs van de markttransacties in één richting (kaal, €/kWh); null als er geen zijn.
+  function marktPrijs(lijst) {
+    var v = 0, e = 0;
+    (Array.isArray(lijst) ? lijst : []).forEach(function (x) { if (x && getal(x.volume_kwh) && x.volume_kwh > 0 && getal(x.price_eur_per_kwh)) { v += x.volume_kwh; e += x.volume_kwh * x.price_eur_per_kwh; } });
+    return v > 0 ? e / v : null;
+  }
   function afrrVan(rij) { if (!rij) return null; var a = rij.balance_energie_eur, b = rij.deal_customer_share_eur; return getal(a) || getal(b) ? (getal(a) ? a : 0) + (getal(b) ? b : 0) : null; }
   async function haalDefinitief(id, dk, rij, force) {
     var sig = JSON.stringify(rij), st = await lees(k(id, 'def:' + dk)), nu = Date.now();
     var recent = nu - grenzen(dk).eind < 7 * 86400000;
-    if (st && st.v === 2 && st.sig === sig && (st.kw || (st.fout && !force)) && nu - st.at < (st.fout ? 86400000 : recent ? 6 * 3600000 : 30 * 86400000)) {
+    if (st && st.v === 3 && st.sig === sig && (st.kw || (st.fout && !force)) && nu - st.at < (st.fout ? 86400000 : recent ? 6 * 3600000 : 30 * 86400000)) {
       if (st.fout) throw Error(st.fout + ' (eerdere controle)');
       return st.kw;
     }
     await wacht(BE_PAUZE);
     var j = await beGet('/customer/' + encodeURIComponent(id) + '/results-v2-api/', { interval: 'day', period: dk, include_vat: '0', include_delivery_cost: '0' });
-    try { var kw = parseDefinitief(j, rij, dk); await schrijf(k(id, 'def:' + dk), { v: 2, sig: sig, at: nu, kw: kw }); return kw; }
-    catch (e) { await schrijf(k(id, 'def:' + dk), { v: 2, sig: sig, at: nu, fout: e.message }); throw e; }
+    try { var kw = parseDefinitief(j, rij, dk); await schrijf(k(id, 'def:' + dk), { v: 3, sig: sig, at: nu, kw: kw }); return kw; }
+    catch (e) { await schrijf(k(id, 'def:' + dk), { v: 3, sig: sig, at: nu, fout: e.message }); throw e; }
   }
   // BE's effectieve kwartierprijs is kosten / kWh: bij heel weinig afname of
   // teruglevering in dat kwartier ontspoort hij. Dan liever de marktprijs.
@@ -733,7 +766,9 @@ function bembPage() {
     var gemUit = rij && getal(rij.avg_sell_price_eur_per_kwh) && Math.abs(rij.avg_sell_price_eur_per_kwh) <= MAX_KAAL ? rij.avg_sell_price_eur_per_kwh : null;
     Object.keys(kw).forEach(function (q) {
       var x = kw[q], b = bron[q] || {}, a = prijzen[q], bronIn = 'BE', bronUit = 'BE';
-      x.pIn = prijsBetrouwbaar(b.pIn, b.imp) ? b.pIn : null; x.pUit = prijsBetrouwbaar(b.pUit, b.exp) ? b.pUit : null;
+      // 1. settlementprijs uit market_breakdown; 2. effectieve prijs (alleen bij genoeg volume).
+      x.pIn = getal(b.mIn) && Math.abs(b.mIn) <= MAX_KAAL ? b.mIn : prijsBetrouwbaar(b.pIn, b.imp) ? b.pIn : null;
+      x.pUit = getal(b.mUit) && Math.abs(b.mUit) <= MAX_KAAL ? b.mUit : prijsBetrouwbaar(b.pUit, b.exp) ? b.pUit : null;
       x.pInVast = getal(x.pIn); x.pUitVast = getal(x.pUit);
       if (!getal(x.pIn) && a && getal(a.ki) && Math.abs(a.ki) <= MAX_KAAL) { x.pIn = a.ki; x.pInVast = !!a.vi; bronIn = a.allin ? 'markt/All-in' : 'markt'; if (a.v) x.prijsVoorlopig = true; }
       if (!getal(x.pUit) && a && getal(a.ke) && Math.abs(a.ke) <= MAX_KAAL) { x.pUit = a.ke; x.pUitVast = !!a.ve; bronUit = a.allin ? 'markt/All-in' : 'markt'; if (a.v) x.prijsVoorlopig = true; }
@@ -846,6 +881,13 @@ function bembPage() {
       return dk;
     }
   }
+  // Zon en gemiddelde prijzen; alleen als ze volledig bekend zijn (anders liever weglaten dan fout).
+  function extraVelden(w, p) {
+    if (!w.pvOnbekend && w.kwartieren) { p.solarKwhGenerated = k3(w.pv); p.solarKwhConsumed = k3(Math.max(w.pv - w.pvExport, 0)); }
+    if (w.imp > 0.01 && w.impMetPrijs >= 0.99 * w.imp) p.avgBuyPrice = (w.impKost / w.impMetPrijs).toFixed(4);
+    if (w.exp > 0.01 && w.expMetPrijs >= 0.99 * w.exp) p.avgSellPrice = (w.expOpbr / w.expMetPrijs).toFixed(4);
+    return p;
+  }
   function dagPayload(r, c) {
     // Meer dan 2 uur met daggemiddelde prijs: geen kwartierwaardering meer, dus als onzeker markeren.
     var w = r.w, invalid = r.bron === 'cache' ? (r.dekking < 0.99 || r.prijsDekking < 0.99 || w.zonderPrijs > 0) : (w.zonderPrijs > 0 || (w.geschattePrijs || 0) > 8);
@@ -855,8 +897,8 @@ function bembPage() {
       (r.bron === 'BE' && c.afrr ? ' plus aFRR-vergoeding' : '') + '. ' + etaTekst(r.eta || ETA) + '.';
     var label = maakLabel('browser', r.bron === 'BE' ? 'be' : 'cache', r.dekking, null, r.kwal);
     note = note.slice(0, 480 - label.length - 1) + ' ' + label;
-    return { date: r.dk, batteryResult: e2(w.totaal), batterySavings: e2(w.besparing),
-      chargedToday: k3(w.geladen), dischargedToday: k3(w.ontladen), invalid: !!invalid, note: note, intervals: intervallen(r.kw) };
+    return extraVelden(w, { date: r.dk, batteryResult: e2(w.totaal), batterySavings: e2(w.besparing),
+      chargedToday: k3(w.geladen), dischargedToday: k3(w.ontladen), invalid: !!invalid, note: note, intervals: intervallen(r.kw) });
   }
 
   /* ── Rondes ── */
@@ -887,6 +929,7 @@ function bembPage() {
       var p = { timestamp: isoAms(m.t), batteryResult: e2(w.totaal), batterySavings: e2(w.besparing),
         chargedToday: k3(w.geladen), dischargedToday: k3(w.ontladen), gridImportToday: k3(w.imp), gridExportToday: k3(w.exp),
         invalid: r.dekking < 0.99 || w.zonderPrijs > 0 };
+      extraVelden(w, p);
       if (getal(m.s) && m.s >= 0 && m.s <= 100) p.batteryCharge = m.s.toFixed(1);
       if (c.proef) p.test = true;
       await mb('POST', '/api/live', p);
@@ -1312,7 +1355,7 @@ function bembPage() {
       for (var i = 1; i <= DAG_VENSTER; i++) {
         var dk = plusDagen(vandaag(), -i), d = null, def = await lees(k(id, 'def:' + dk));
         try {
-          if (def && def.v === 2 && def.kw) {
+          if (def && def.v === 3 && def.kw) {
             var dd = verdeelDefinitief(def.kw, await cacheKwartieren(id, dk), ETA);
             var defRij = null; try { defRij = JSON.parse(def.sig); } catch (e) {}
             d = { bron: 'BE', dekking: 1, w: waardeer(kiesPrijzen(dd.kw, def.kw, await prijsIndex(id), defRij), c, c.afrr ? afrrVan(defRij) : null) };
