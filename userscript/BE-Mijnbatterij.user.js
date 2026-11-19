@@ -355,6 +355,12 @@ function bembPage() {
   }
 
   if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger, vulOnbalans: vulOnbalans, tenergyAanvullen: tenergyAanvullen, prijsKeuze: prijsKeuze, zetActief: zetActief, tenergyVast: tenergyVast, zetPrijzen: zetPrijzen, parseDefinitief: parseDefinitief, marktPrijs: marktPrijs, extraVelden: extraVelden, dagPayload: dagPayload }; return; }
+  // Diagnose (alleen als localStorage 'bemb_debug' = '1'): rekenfuncties en gegevens bereikbaar via window.__bemb.
+  try {
+    if (localStorage.getItem('bemb_debug') === '1') window.__bemb = Object.assign({ verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger, vulOnbalans: vulOnbalans, tenergyAanvullen: tenergyAanvullen, prijsKeuze: prijsKeuze, zetActief: zetActief, tenergyVast: tenergyVast, zetPrijzen: zetPrijzen, parseDefinitief: parseDefinitief, marktPrijs: marktPrijs, extraVelden: extraVelden, dagPayload: dagPayload }, {
+      cacheKwartieren: cacheKwartieren, haalDefinitief: haalDefinitief, prijsIndex: prijsIndex, klant: klant, dagDefinitief: dagDefinitief,
+      maandBron: maandBron, rijVan: rijVan, cfg: cfg, lees: lees, k: k, versie: VERSIE });
+  } catch (e) {}
 
   /* ── Installatie en instellingen ── */
   function geldig(id) { return !!id && /^[A-Za-z0-9_-]+$/.test(id) && !/^(?:account|results|current-history|current-prices|undefined|null)$/i.test(id); }
