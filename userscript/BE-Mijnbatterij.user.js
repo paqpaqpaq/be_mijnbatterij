@@ -280,6 +280,13 @@ function bembPage() {
   }
   // Complete BE-kwartieren: bruto kWh van BE, verdeling uit de eigen cache
   // als die het kwartier goed dekt, anders uit de netto accubeweging.
+  // Fysieke grenzen per kwartier (BE rondt accu/huis/zon af op 0,1 kWh): de accu kan niet meer
+  // naar het net leveren dan er werd teruggeleverd, en niet meer uit zon laden dan er opgewekt werd.
+  function fysiek(n, v) {
+    var ont = n.ontHuis + n.ontNet, lad = n.ladNet + n.ladPV;
+    n.ontNet = Math.min(n.ontNet, Math.max(v.exp, 0)); n.ontHuis = ont - n.ontNet;
+    if (getal(v.pv)) { n.ladPV = Math.min(n.ladPV, Math.max(v.pv, 0)); n.ladNet = lad - n.ladPV; }
+  }
   function verdeelDefinitief(bron, cache, e) {
     var uit = {}, uitCache = 0, geschat = 0, geschatActief = 0, aangevuld = 0, ontbrekend = 0;
     Object.keys(bron).forEach(function (q) {
@@ -307,12 +314,14 @@ function bembPage() {
         var vraag = Math.max(v.load - v.pv, 0), over = Math.max(v.pv - v.load, 0);
         n.ontHuis = Math.min(ontAC, vraag); n.ontNet = ontAC - n.ontHuis;
         n.ladPV = Math.min(ladAC, over); n.ladNet = ladAC - n.ladPV; geschat++; geschatActief++;
+        fysiek(n, v);
       } else {
         // Eén richting in het kwartier: uit de netstromen volgt de verdeling exact (op kwartierniveau).
         var netto = ontAC - ladAC; if (Math.abs(netto) < 1e-9) netto = 0;
         var ont = Math.max(netto, 0), lad = Math.max(-netto, 0), rest = v.imp - v.exp + netto;
         n.ladPV = Math.min(lad, Math.max(-rest, 0)); n.ladNet = lad - n.ladPV;
         n.ontHuis = Math.min(ont, Math.max(rest, 0)); n.ontNet = ont - n.ontHuis; geschat++;
+        fysiek(n, v);
         // Onzeker alleen als er in hetzelfde kwartier ook laden+ontladen of afname+teruglevering was.
         if ((v.laden > 0 && v.ontladen > 0) || ((v.laden > 0 || v.ontladen > 0) && v.imp > 0.02 && v.exp > 0.02)) geschatActief++;
       }
@@ -731,6 +740,7 @@ function bembPage() {
         pIn: getal(v.effective_import_price_eur_per_kwh) ? v.effective_import_price_eur_per_kwh : null,
         pUit: getal(v.effective_export_price_eur_per_kwh) ? v.effective_export_price_eur_per_kwh : null,
         mIn: mb ? marktPrijs(mb.purchases) : null, mUit: mb ? marktPrijs(mb.sales) : null,
+        imbIn: mb ? marktPrijs(mb.purchases, 'imbalance') : null, imbUit: mb ? marktPrijs(mb.sales, 'imbalance') : null,
         pv: getal(v.solar_direct_kwh) && v.solar_direct_kwh >= 0 ? v.solar_direct_kwh : null,
         load: getal(v.load_kwh) && v.load_kwh >= 0 ? v.load_kwh : null };
     });
@@ -740,9 +750,9 @@ function bembPage() {
     return out;
   }
   // Volumegewogen prijs van de markttransacties in één richting (kaal, €/kWh); null als er geen zijn.
-  function marktPrijs(lijst) {
+  function marktPrijs(lijst, markt) {
     var v = 0, e = 0;
-    (Array.isArray(lijst) ? lijst : []).forEach(function (x) { if (x && getal(x.volume_kwh) && x.volume_kwh > 0 && getal(x.price_eur_per_kwh)) { v += x.volume_kwh; e += x.volume_kwh * x.price_eur_per_kwh; } });
+    (Array.isArray(lijst) ? lijst : []).forEach(function (x) { if (x && (!markt || x.market === markt) && getal(x.volume_kwh) && x.volume_kwh > 0 && getal(x.price_eur_per_kwh)) { v += x.volume_kwh; e += x.volume_kwh * x.price_eur_per_kwh; } });
     return v > 0 ? e / v : null;
   }
   function afrrVan(rij) { if (!rij) return null; var a = rij.balance_energie_eur, b = rij.deal_customer_share_eur; return getal(a) || getal(b) ? (getal(a) ? a : 0) + (getal(b) ? b : 0) : null; }
@@ -772,6 +782,10 @@ function bembPage() {
       x.pInVast = getal(x.pIn); x.pUitVast = getal(x.pUit);
       if (!getal(x.pIn) && a && getal(a.ki) && Math.abs(a.ki) <= MAX_KAAL) { x.pIn = a.ki; x.pInVast = !!a.vi; bronIn = a.allin ? 'markt/All-in' : 'markt'; if (a.v) x.prijsVoorlopig = true; }
       if (!getal(x.pUit) && a && getal(a.ke) && Math.abs(a.ke) <= MAX_KAAL) { x.pUit = a.ke; x.pUitVast = !!a.ve; bronUit = a.allin ? 'markt/All-in' : 'markt'; if (a.v) x.prijsVoorlopig = true; }
+      // Onbalans heeft buiten regeltoestand 2 één prijs voor tekort en overschot: zonder handel in de
+      // ene richting is de onbalansprijs van de andere richting de beste benadering (niet vastgesteld).
+      if (!getal(x.pIn) && getal(b.imbUit) && Math.abs(b.imbUit) <= MAX_KAAL) { x.pIn = b.imbUit; x.pInVast = false; bronIn = 'onbalans (andere richting)'; }
+      if (!getal(x.pUit) && getal(b.imbIn) && Math.abs(b.imbIn) <= MAX_KAAL) { x.pUit = b.imbIn; x.pUitVast = false; bronUit = 'onbalans (andere richting)'; }
       if (!getal(x.pIn) && getal(gemIn)) { x.pIn = gemIn; bronIn = 'daggemiddelde'; x.prijsGeschatIn = true; }
       if (!getal(x.pUit) && getal(gemUit)) { x.pUit = gemUit; bronUit = 'daggemiddelde'; x.prijsGeschatUit = true; }
       x.prijsBron = bronIn === bronUit ? bronIn : 'in ' + bronIn + ' / uit ' + bronUit;
