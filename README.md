@@ -19,7 +19,7 @@ De plugin staat in [`userscript/BE-Mijnbatterij.user.js`](userscript/BE-Mijnbatt
    - je gebruikersnaam en wachtwoord van het BE-dashboard;
    - je Mijnbatterij API-sleutel (te vinden op je profielpagina).
 
-De **proefstand** staat standaard aan. Alles gaat dan met `test: true` naar Mijnbatterij: het wordt gecontroleerd, maar niet opgeslagen. Zet de proefstand uit via *Configureren* zodra de sensoren kloppen.
+Bij het instellen kies je of je eerst wilt proberen (**proefstand**, standaard uit). In proefstand gaat alles met `test: true` naar Mijnbatterij: het wordt gecontroleerd, maar niet opgeslagen. Alle instellingen staan als schakelaars op het apparaat *BE Mijnbatterij*: versturen, proefstand, EB op teruglevering en aFRR als handel. Zolang de proefstand aan staat, staat er een melding onder *Instellingen → Reparaties*, zodat hij niet ongemerkt aan blijft.
 
 ## Wat de integratie doet
 

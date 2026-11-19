@@ -3,11 +3,15 @@
     "step": {
       "user": {
         "title": "Balans Energie → Mijnbatterij",
-        "description": "Balans Energie customer dashboard login and your Mijnbatterij API key (profile page on mijnbatterij.nl). Test mode is on by default: requests are validated, nothing is stored.",
+        "description": "Balans Energie customer dashboard login and your Mijnbatterij API key (profile page on mijnbatterij.nl).",
         "data": {
           "be_username": "BE username (email)",
           "be_password": "BE password",
-          "mb_api_key": "Mijnbatterij API key"
+          "mb_api_key": "Mijnbatterij API key",
+          "proef": "Try first (test mode: validate only, store nothing)"
+        },
+        "data_description": {
+          "proef": "Can be changed later with the ‘Test mode’ switch on the device."
         }
       },
       "reauth_confirm": {
@@ -82,6 +86,20 @@
       "nu_versturen": {
         "name": "Send now"
       }
+    },
+    "switch": {
+      "versturen": {
+        "name": "Send to Mijnbatterij"
+      },
+      "proef": {
+        "name": "Test mode (store nothing)"
+      },
+      "saldeert": {
+        "name": "Energy tax on feed-in (until 2026)"
+      },
+      "afrr": {
+        "name": "aFRR fees as trading"
+      }
     }
   },
   "services": {
@@ -94,6 +112,12 @@
           "description": "Format YYYY-MM"
         }
       }
+    }
+  },
+  "issues": {
+    "proefstand": {
+      "title": "BE Mijnbatterij is in test mode",
+      "description": "For {naam} requests are only validated: Mijnbatterij stores nothing and the browser plugin keeps sending itself. Turn off the ‘Test mode’ switch on the BE Mijnbatterij device (Settings → Devices & services) to share for real."
     }
   }
 }

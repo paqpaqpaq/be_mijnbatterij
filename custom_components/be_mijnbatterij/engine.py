@@ -71,7 +71,7 @@ class Engine:
 
     @property
     def proef(self) -> bool:
-        return bool(self.opties.get("proef", True))
+        return bool(self.opties.get("proef", False))
 
     @property
     def versturen(self) -> bool:

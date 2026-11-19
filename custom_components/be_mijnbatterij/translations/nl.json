@@ -3,11 +3,15 @@
     "step": {
       "user": {
         "title": "Balans Energie → Mijnbatterij",
-        "description": "Inloggegevens van het Balans Energie-klantdashboard en je Mijnbatterij API-sleutel (profielpagina op mijnbatterij.nl). Proefstand staat standaard aan: er wordt dan alleen gevalideerd, niets opgeslagen.",
+        "description": "Inloggegevens van het Balans Energie-klantdashboard en je Mijnbatterij API-sleutel (profielpagina op mijnbatterij.nl).",
         "data": {
           "be_username": "BE gebruikersnaam (e-mail)",
           "be_password": "BE wachtwoord",
-          "mb_api_key": "Mijnbatterij API-sleutel"
+          "mb_api_key": "Mijnbatterij API-sleutel",
+          "proef": "Eerst proberen (proefstand: alleen valideren, niets opslaan)"
+        },
+        "data_description": {
+          "proef": "Later om te zetten met de schakelaar ‘Proefstand’ op het apparaat."
         }
       },
       "reauth_confirm": {
@@ -82,6 +86,20 @@
       "nu_versturen": {
         "name": "Nu versturen"
       }
+    },
+    "switch": {
+      "versturen": {
+        "name": "Versturen naar Mijnbatterij"
+      },
+      "proef": {
+        "name": "Proefstand (niets opslaan)"
+      },
+      "saldeert": {
+        "name": "EB op teruglevering (t/m 2026)"
+      },
+      "afrr": {
+        "name": "aFRR-vergoedingen als handel"
+      }
     }
   },
   "services": {
@@ -94,6 +112,12 @@
           "description": "Formaat JJJJ-MM"
         }
       }
+    }
+  },
+  "issues": {
+    "proefstand": {
+      "title": "BE Mijnbatterij staat in proefstand",
+      "description": "Voor {naam} wordt alleen gevalideerd: Mijnbatterij slaat niets op en de browserplugin blijft zelf versturen. Zet de schakelaar ‘Proefstand’ uit op het apparaat BE Mijnbatterij (Instellingen → Apparaten & diensten) als je echt wilt delen."
     }
   }
 }

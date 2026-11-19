@@ -31,6 +31,9 @@ async def _controleer(hass, data: Mapping[str, Any]) -> tuple[str, str]:
     return installatie, str((me or {}).get("username") or (me or {}).get("name") or "")
 
 
+SCHEMA_NIEUW = SCHEMA.extend({vol.Required(OPT_PROEF, default=False): bool})
+
+
 class BEMBConfigFlow(ConfigFlow, domain=DOMAIN):
     VERSION = 1
 
@@ -48,9 +51,10 @@ class BEMBConfigFlow(ConfigFlow, domain=DOMAIN):
             else:
                 await self.async_set_unique_id(installatie)
                 self._abort_if_unique_id_configured()
+                data = {k: v for k, v in user_input.items() if k != OPT_PROEF}
                 return self.async_create_entry(title=f"Balans {installatie}" + (f" · {naam}" if naam else ""),
-                                               data=user_input, options=dict(STANDAARD_OPTIES))
-        return self.async_show_form(step_id="user", data_schema=self.add_suggested_values_to_schema(SCHEMA, user_input),
+                                               data=data, options={**STANDAARD_OPTIES, OPT_PROEF: bool(user_input.get(OPT_PROEF))})
+        return self.async_show_form(step_id="user", data_schema=self.add_suggested_values_to_schema(SCHEMA_NIEUW, user_input),
                                     errors=fouten)
 
     async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> ConfigFlowResult:

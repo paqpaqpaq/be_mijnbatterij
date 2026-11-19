@@ -6,6 +6,7 @@ from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
 
 from custom_components.be_mijnbatterij import api
 from custom_components.be_mijnbatterij.const import DOMAIN
@@ -38,8 +39,9 @@ async def test_flow_fout_wachtwoord(hass: HomeAssistant, server) -> None:
 
 async def test_volledig(hass: HomeAssistant, server) -> None:
     r = await hass.config_entries.flow.async_init(DOMAIN, context={"source": config_entries.SOURCE_USER})
-    r = await hass.config_entries.flow.async_configure(r["flow_id"], GEGEVENS)
+    r = await hass.config_entries.flow.async_configure(r["flow_id"], {**GEGEVENS, "proef": True})
     assert r["type"] is FlowResultType.CREATE_ENTRY, r
+    assert "proef" not in r["data"] and r["options"]["proef"] is True
     assert r["title"].startswith("Balans ABC123")
     await hass.async_block_till_done()
     entry = hass.config_entries.async_entries(DOMAIN)[0]
@@ -55,10 +57,22 @@ async def test_volledig(hass: HomeAssistant, server) -> None:
     assert fs.mb_log and all(b.get("test") for _, b in fs.mb_log)
     assert not fs.mb_db
 
-    # proefstand uit → knop → echt versturen + heartbeat
-    r = await hass.config_entries.options.async_init(entry.entry_id)
-    r = await hass.config_entries.options.async_configure(r["flow_id"], {"versturen": True, "proef": False, "saldeert": True, "afrr": True})
+    # proefstand zichtbaar: schakelaar aan + melding onder Reparaties
+    issues = ir.async_get(hass)
+    assert hass.states.get(eid("switch", "optie_proef")).state == "on"
+    assert issues.async_get_issue(DOMAIN, f"proefstand_{entry.entry_id}")
+
+    # proefstand uit via de schakelaar → melding weg → knop → echt versturen + heartbeat
+    await hass.services.async_call("switch", "turn_off", {"entity_id": eid("switch", "optie_proef")}, blocking=True)
     await hass.async_block_till_done()
+    assert entry.options["proef"] is False and not entry.runtime_data.engine.proef
+    assert hass.states.get(eid("switch", "optie_proef")).state == "off"
+    assert not issues.async_get_issue(DOMAIN, f"proefstand_{entry.entry_id}")
+    # de optiestroom werkt nog steeds en blijft gelijk lopen met de schakelaars
+    r = await hass.config_entries.options.async_init(entry.entry_id)
+    r = await hass.config_entries.options.async_configure(r["flow_id"], {"versturen": True, "proef": False, "saldeert": True, "afrr": False})
+    await hass.async_block_till_done()
+    assert hass.states.get(eid("switch", "optie_afrr")).state == "off"
     await hass.services.async_call("button", "press", {"entity_id": eid("button", "nu_versturen")}, blocking=True)
     await hass.async_block_till_done()
     assert fs.mb_db, "geen dagen opgeslagen"
@@ -68,4 +82,14 @@ async def test_volledig(hass: HomeAssistant, server) -> None:
 
     res = await hass.services.async_call(DOMAIN, "historie_herstellen", {"vanaf": fs.DK[:7]}, blocking=True, return_response=True)
     print("  historie:", list(res["rapport"].values())[0][:2])
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_standaard_echt(hass: HomeAssistant, server) -> None:
+    r = await hass.config_entries.flow.async_init(DOMAIN, context={"source": config_entries.SOURCE_USER})
+    r = await hass.config_entries.flow.async_configure(r["flow_id"], GEGEVENS)
+    assert r["options"]["proef"] is False
+    await hass.async_block_till_done()
+    entry = hass.config_entries.async_entries(DOMAIN)[0]
+    assert not ir.async_get(hass).async_get_issue(DOMAIN, f"proefstand_{entry.entry_id}")
     assert await hass.config_entries.async_unload(entry.entry_id)
