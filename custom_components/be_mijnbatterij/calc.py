@@ -433,19 +433,37 @@ def verwerk_prijzen(arch: dict[int, dict], j: dict | None, now_ms: int, tenergy:
     for p in j["prices"]:
         if not isinstance(p, dict) or not getal(p.get("start")) or p["start"] % Q or p.get("carried"):
             continue
-        p = {**p, "values": vul_onbalans(p.get("values"), (tenergy or {}).get(str(int(p["start"]))))}
+        orig = p.get("values") or {}
+        t = (tenergy or {}).get(str(int(p["start"])))
+        tv, af = tenergy_vast(t, int(p["start"]), now_ms), p["start"] + Q <= now_ms
+        p = {**p, "values": vul_onbalans(orig, t)}
         keus, oud = prijs_keuze(p, ctx, events, disc), arch.get(int(p["start"])) or {}
         if keus["ki"] is None and keus["ke"] is None and oud:
             continue  # BE gaf voor dit kwartier niets meer: eerder vastgelegde prijs houden
         tijdelijk = bool(p.get("temporaryTariffs")) or (p["start"] <= now_ms < p["start"] + Q)
+        be_i = keus["ki"] is not None and getal(orig.get(keus["mi"]))
+        be_e = keus["ke"] is not None and getal(orig.get(keus["me"]))
+        houd_i = keus["ki"] is None and oud.get("mi") == keus["mi"]
+        houd_e = keus["ke"] is None and oud.get("me") == keus["me"]
         arch[int(p["start"])] = {
             "mi": keus["mi"], "me": keus["me"],
-            "ki": keus["ki"] if keus["ki"] is not None else (oud.get("ki") if oud.get("mi") == keus["mi"] else None),
-            "ke": keus["ke"] if keus["ke"] is not None else (oud.get("ke") if oud.get("me") == keus["me"] else None),
+            "ki": keus["ki"] if keus["ki"] is not None else (oud.get("ki") if houd_i else None),
+            "ke": keus["ke"] if keus["ke"] is not None else (oud.get("ke") if houd_e else None),
             "v": bool(p.get("provisional")) or tijdelijk, "t": now_ms,
+            "ti": (not be_i) if keus["ki"] is not None else (bool(oud.get("ti")) if houd_i else False),
+            "te": (not be_e) if keus["ke"] is not None else (bool(oud.get("te")) if houd_e else False),
+            "vi": (af if be_i else tv) if keus["ki"] is not None else (bool(oud.get("vi")) if houd_i else False),
+            "ve": (af if be_e else tv) if keus["ke"] is not None else (bool(oud.get("ve")) if houd_e else False),
         }
         n += 1
     return n
+
+
+def tenergy_vast(t: dict | None, q: int, now_ms: int) -> bool:
+    """Vastgesteld = na afloop bepaald: door BE zelf (activiteit/aFRR), of door Tenergy met de
+    regeltoestand uit de activatiedata, zoals het BE-dashboard. Zonder activatiedata is het
+    alleen de prijs van de laatste minuut: bruikbaar, maar niet vastgesteld."""
+    return bool(t and t.get("klaar") and t.get("rs") is not None and q + Q <= now_ms)
 
 
 def tenergy_aanvullen(arch: dict[int, dict], tenergy: dict | None, now_ms: int, van_ms: int) -> int:
@@ -456,17 +474,20 @@ def tenergy_aanvullen(arch: dict[int, dict], tenergy: dict | None, now_ms: int, 
         q = int(k)
         if q < van_ms or q > now_ms or q % Q:
             continue
-        a = arch.get(q)
+        a, tv = arch.get(q), tenergy_vast(t, q, now_ms)
         if not a:
-            arch[q] = {"mi": "onbalans_import", "me": "onbalans_export", "ki": t.get("ki"), "ke": t.get("ke"),
-                       "v": not t.get("klaar") or q + Q > now_ms, "t": now_ms}
+            arch[q] = {"mi": "onbalans_import", "me": "onbalans_export",
+                       "ki": t.get("ki") if getal(t.get("ki")) else None, "ke": t.get("ke") if getal(t.get("ke")) else None,
+                       "v": not t.get("klaar") or q + Q > now_ms, "t": now_ms, "ti": True, "te": True,
+                       "vi": tv and getal(t.get("ki")), "ve": tv and getal(t.get("ke"))}
             n += 1
             continue
         gewijzigd = False
-        if a.get("mi") == "onbalans_import" and not getal(a.get("ki")) and getal(t.get("ki")):
-            a["ki"] = t["ki"]; gewijzigd = True
-        if a.get("me") == "onbalans_export" and not getal(a.get("ke")) and getal(t.get("ke")):
-            a["ke"] = t["ke"]; gewijzigd = True
+        # Ontbreekt de prijs, of kwam hij eerder (nog niet vastgesteld) van Tenergy: bijwerken.
+        if a.get("mi") == "onbalans_import" and getal(t.get("ki")) and (not getal(a.get("ki")) or (a.get("ti") and not a.get("vi"))):
+            a.update(ki=t["ki"], ti=True, vi=tv); gewijzigd = True
+        if a.get("me") == "onbalans_export" and getal(t.get("ke")) and (not getal(a.get("ke")) or (a.get("te") and not a.get("ve"))):
+            a.update(ke=t["ke"], te=True, ve=tv); gewijzigd = True
         n += gewijzigd
     return n
 
@@ -484,9 +505,9 @@ def zet_prijzen(kw: dict[int, dict], prijzen: dict[int, dict]) -> dict[int, dict
     for q, x in kw.items():
         p = prijzen.get(q)
         if not getal(x.get("pIn")) and p:
-            x["pIn"] = p.get("ki")
+            x["pIn"], x["pInVast"] = p.get("ki"), bool(p.get("vi"))
         if not getal(x.get("pUit")) and p:
-            x["pUit"] = p.get("ke")
+            x["pUit"], x["pUitVast"] = p.get("ke"), bool(p.get("ve"))
         if p and p.get("v"):
             x["prijsVoorlopig"] = True
     return kw
@@ -507,12 +528,13 @@ def kies_prijzen(kw: dict[int, dict], bron: dict[int, dict], prijzen: dict[int, 
         bin_, buit = "BE", "BE"
         x["pIn"] = b.get("pIn") if prijs_betrouwbaar(b.get("pIn"), b.get("imp", 0)) else None
         x["pUit"] = b.get("pUit") if prijs_betrouwbaar(b.get("pUit"), b.get("exp", 0)) else None
+        x["pInVast"], x["pUitVast"] = getal(x["pIn"]), getal(x["pUit"])
         if not getal(x["pIn"]) and a and getal(a.get("ki")) and abs(a["ki"]) <= MAX_KAAL:
-            x["pIn"], bin_ = a["ki"], "markt"
+            x["pIn"], x["pInVast"], bin_ = a["ki"], bool(a.get("vi")), "markt"
             if a.get("v"):
                 x["prijsVoorlopig"] = True
         if not getal(x["pUit"]) and a and getal(a.get("ke")) and abs(a["ke"]) <= MAX_KAAL:
-            x["pUit"], buit = a["ke"], "markt"
+            x["pUit"], x["pUitVast"], buit = a["ke"], bool(a.get("ve")), "markt"
             if a.get("v"):
                 x["prijsVoorlopig"] = True
         if not getal(x["pIn"]) and gem_in is not None:
@@ -529,7 +551,7 @@ def waardeer(kw: dict[int, dict], saldeert: bool, afrr_eur: float | None) -> dic
     laadkosten worden naar rato van die kWh verdeeld."""
     t = {"ontHuis": 0.0, "ontNet": 0.0, "ladNet": 0.0, "ladPV": 0.0, "huis": 0.0, "net": 0.0, "kNet": 0.0,
          "kPV": 0.0, "imp": 0.0, "exp": 0.0, "geladen": 0.0, "ontladen": 0.0, "accuSec": 0.0, "prijsSec": 0.0,
-         "zonderPrijs": 0, "voorlopigePrijs": 0, "kwartieren": 0, "geschattePrijs": 0}
+         "zonderPrijs": 0, "voorlopigePrijs": 0, "kwartieren": 0, "geschattePrijs": 0, "vastSec": 0, "onzeker": 0}
     for q in sorted(kw):
         x = kw[q]
         t["kwartieren"] += 1
@@ -543,6 +565,7 @@ def waardeer(kw: dict[int, dict], saldeert: bool, afrr_eur: float | None) -> dic
         t["ontladen"] += x["ontladen"] if getal(x.get("ontladen")) else x["ontHuis"] + x["ontNet"]
         if x["ontHuis"] + x["ontNet"] + x["ladNet"] + x["ladPV"] < 1e-9:
             t["prijsSec"] += sec
+            t["vastSec"] += sec
             continue
         pi, pe = allin(x.get("pIn"), False, q, saldeert), allin(x.get("pUit"), True, q, saldeert)
         if ((x["ontHuis"] > 0 or x["ladNet"] > 0) and pi is None) or ((x["ontNet"] > 0 or x["ladPV"] > 0) and pe is None):
@@ -551,6 +574,11 @@ def waardeer(kw: dict[int, dict], saldeert: bool, afrr_eur: float | None) -> dic
         t["prijsSec"] += sec
         if x.get("prijsVoorlopig"):
             t["voorlopigePrijs"] += 1
+        # Alleen vastgestelde prijzen tellen voor de nauwkeurigheid (afstemming plugin ↔ HA).
+        if ((x["ontHuis"] > 0 or x["ladNet"] > 0) and not x.get("pInVast")) or ((x["ontNet"] > 0 or x["ladPV"] > 0) and not x.get("pUitVast")):
+            t["onzeker"] += 1
+        else:
+            t["vastSec"] += sec
         for f in FLOWS:
             t[f] += x[f]
         t["huis"] += x["ontHuis"] * (pi or 0)
@@ -695,7 +723,8 @@ def kwaliteit(d: dict, w: dict) -> float:
     n = d.get("n") or 0
     if not n:
         return 0.0
-    slecht = d["geschatActief"] + d["ontbrekend"] + (w.get("geschattePrijs") or 0) + (w.get("zonderPrijs") or 0)
+    slecht = (d["geschatActief"] + d["ontbrekend"] + (w.get("geschattePrijs") or 0) + (w.get("zonderPrijs") or 0)
+              + (w.get("onzeker") or 0))
     return max(0.0, min(1.0, (n - slecht) / n))
 
 
@@ -709,7 +738,7 @@ LABEL_RE = re.compile(r"\[BEMB ([^\]]*)\]")
 def maak_label(versie: str, bron: str, type_: str, dekking: float, actief: str | None = None,
                kwal: float | None = None) -> str:
     deel = f"v={versie} bron={bron} type={type_} dekking={to_fixed(100 * dekking, 1)}"
-    if type_ == "be" and getal(kwal):
+    if getal(kwal):
         deel += f" kwal={to_fixed(100 * kwal, 1)}"
     if actief:
         deel += f" actief={actief}"
@@ -775,13 +804,24 @@ def mag_overschrijven(bestaand: dict | None, nieuw_type: str, nieuw_dekking: flo
     """Afstemmingsregel voor een dagrecord op Mijnbatterij (gelijk in plugin en HA).
 
     - BE-definitief wordt nooit vervangen door een voorlopige (cache) versie.
-    - Voorlopig vervangt voorlopig alleen bij minstens gelijke dekking.
-    - Definitief vervangt definitief alleen bij minstens gelijke nauwkeurigheid (kwal).
+    - Zelfde soort vervangt alleen bij minstens gelijke nauwkeurigheid (kwal): het aandeel
+      van de dag met eigen meting én vastgestelde prijs. Labels zonder kwal tellen als 0.
     - Records zonder label (oude versies) mogen worden vervangen.
     """
     lab = lees_label((bestaand or {}).get("note"))
     if not lab:
         return True, ""
+    if lab.get("type") == "be" and nieuw_type != "be":
+        return False, "definitieve versie staat er al"
+    if lab.get("type") == nieuw_type:
+        try:
+            oud_k = float(lab.get("kwal", "0"))
+        except ValueError:
+            oud_k = 0.0
+        nk = 100 * (nieuw_kwal or 0)
+        if oud_k > nk + TOLERANTIE:
+            return False, f"bestaande versie is nauwkeuriger ({oud_k:.1f}% tegen {nk:.1f}%)"
+    return True, ""
     if lab.get("type") == "be" and nieuw_type != "be":
         return False, "definitieve versie staat er al"
     if lab.get("type") == "be" and nieuw_type == "be":

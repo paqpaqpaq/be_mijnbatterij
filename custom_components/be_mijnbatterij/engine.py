@@ -229,7 +229,8 @@ class Engine:
         kw = {q: x for q, x in calc.zet_prijzen(self.kw_dag(dk), self.prijs_index()).items() if q < einde}
         w = calc.waardeer(kw, self.saldeert, None)
         return {"dk": dk, "bron": "cache", "kw": kw, "w": w, "eta": self.eta,
-                "dekking": min(1.0, w["accuSec"] / duur), "prijsDekking": min(1.0, w["prijsSec"] / duur)}
+                "dekking": min(1.0, w["accuSec"] / duur), "prijsDekking": min(1.0, w["prijsSec"] / duur),
+                "kwal": min(1.0, w["vastSec"] / duur)}
 
     async def maand_bron(self, ym: str, ttl_s: float) -> dict:
         m = self._maand_cache.get(ym)

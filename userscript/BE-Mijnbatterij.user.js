@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BE Mijnbatterij
 // @namespace    paq.balansenergie
-// @version      1.2.4
+// @version      1.2.5
 // @description  Deelt accuresultaten van het Balans Energie-dashboard met mijnbatterij.nl, gesplitst in handel en besparing. Los van Balansenergie All-in; eigen pagina in het menu.
 // @homepageURL  https://github.com/paqpaqpaq/be_mijnbatterij
 // @updateURL    https://raw.githubusercontent.com/paqpaqpaq/be_mijnbatterij/main/userscript/BE-Mijnbatterij.user.js
@@ -77,7 +77,7 @@
         poging++;
         fn({
           method: method, url: API + v.path, timeout: 25000,
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.2.4' },
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.2.5' },
           data: v.body ? JSON.stringify(v.body) : undefined,
           onload: function (r) {
             var ok = r.status >= 200 && r.status < 300, text = String(r.responseText || '');
@@ -103,7 +103,7 @@ function bembPage() {
   if (window.__bembLoaded) return;
   window.__bembLoaded = true;
 
-  var VERSIE = '1.2.4', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
+  var VERSIE = '1.2.5', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
   // Marge (procentpunt): twee verzenders met vrijwel volledige data mogen elkaar vervangen;
   // aanvullen naast HA gebeurt pas bij +1 pp, zodat ze niet pingpongen.
   var TOLERANTIE = 0.5;
@@ -229,7 +229,7 @@ function bembPage() {
   // ontladen kWh; laadkosten worden naar rato van die kWh verdeeld.
   function waardeer(kw, c, afrrEur) {
     var t = { ontHuis: 0, ontNet: 0, ladNet: 0, ladPV: 0, huis: 0, net: 0, kNet: 0, kPV: 0, imp: 0, exp: 0,
-      geladen: 0, ontladen: 0, accuSec: 0, prijsSec: 0, zonderPrijs: 0, voorlopigePrijs: 0, kwartieren: 0 };
+      geladen: 0, ontladen: 0, accuSec: 0, prijsSec: 0, vastSec: 0, onzeker: 0, zonderPrijs: 0, voorlopigePrijs: 0, kwartieren: 0 };
     Object.keys(kw).forEach(function (k) {
       var x = kw[k], q = +k; t.kwartieren++;
       t.imp += x.imp || 0; t.exp += x.exp || 0;
@@ -237,10 +237,12 @@ function bembPage() {
       var sec = Math.min(900, x.accuSec); t.accuSec += sec;
       t.geladen += getal(x.geladen) ? x.geladen : x.ladNet + x.ladPV;
       t.ontladen += getal(x.ontladen) ? x.ontladen : x.ontHuis + x.ontNet;
-      if (x.ontHuis + x.ontNet + x.ladNet + x.ladPV < 1e-9) { t.prijsSec += sec; return; }
+      if (x.ontHuis + x.ontNet + x.ladNet + x.ladPV < 1e-9) { t.prijsSec += sec; t.vastSec += sec; return; }
       var pi = allin(x.pIn, false, q, c), pe = allin(x.pUit, true, q, c);
       if (((x.ontHuis > 0 || x.ladNet > 0) && !getal(pi)) || ((x.ontNet > 0 || x.ladPV > 0) && !getal(pe))) { t.zonderPrijs++; return; }
       t.prijsSec += sec; if (x.prijsVoorlopig) t.voorlopigePrijs++;
+      // Alleen vastgestelde prijzen tellen voor de nauwkeurigheid (afstemming plugin ↔ HA).
+      if (((x.ontHuis > 0 || x.ladNet > 0) && !x.pInVast) || ((x.ontNet > 0 || x.ladPV > 0) && !x.pUitVast)) t.onzeker++; else t.vastSec += sec;
       t.ontHuis += x.ontHuis; t.ontNet += x.ontNet; t.ladNet += x.ladNet; t.ladPV += x.ladPV;
       t.huis += x.ontHuis * (pi || 0); t.net += x.ontNet * (pe || 0);
       t.kNet += x.ladNet * (pi || 0); t.kPV += x.ladPV * (pe || 0);
@@ -298,7 +300,7 @@ function bembPage() {
   // metingen en een echte prijs. Bepaalt welke verzender een BE-dag mag vervangen.
   function kwaliteit(d, w) {
     var n = d.n || 0; if (!n) return 0;
-    var slecht = d.geschatActief + d.ontbrekend + (w.geschattePrijs || 0) + (w.zonderPrijs || 0);
+    var slecht = d.geschatActief + d.ontbrekend + (w.geschattePrijs || 0) + (w.zonderPrijs || 0) + (w.onzeker || 0);
     return Math.max(0, Math.min(1, (n - slecht) / n));
   }
   function prijsKeuze(p, ctx, events, disc) {
@@ -319,7 +321,7 @@ function bembPage() {
       onbekend: function (s) { return w.some(function (x) { return s >= x[0] && s < x[1]; }); } };
   }
 
-  if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger, vulOnbalans: vulOnbalans, tenergyAanvullen: tenergyAanvullen, prijsKeuze: prijsKeuze, zetActief: zetActief }; return; }
+  if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger, vulOnbalans: vulOnbalans, tenergyAanvullen: tenergyAanvullen, prijsKeuze: prijsKeuze, zetActief: zetActief, tenergyVast: tenergyVast, zetPrijzen: zetPrijzen }; return; }
 
   /* ── Installatie en instellingen ── */
   function geldig(id) { return !!id && /^[A-Za-z0-9_-]+$/.test(id) && !/^(?:account|results|current-history|current-prices|undefined|null)$/i.test(id); }
@@ -512,16 +514,21 @@ function bembPage() {
     }
     return v;
   }
+  // Vastgesteld = na afloop van het kwartier bepaald: door BE zelf (activiteit/aFRR), of door
+  // Tenergy met de regeltoestand uit de activatiedata (zoals het BE-dashboard). Zonder
+  // activatiedata is het alleen de prijs van de laatste minuut: bruikbaar, niet vastgesteld.
+  function tenergyVast(t, q, nu) { return !!(t && t.klaar && t.rs !== null && t.rs !== undefined && q + Q <= nu); }
   function tenergyAanvullen(arch, ten, nu, van) {
     var n = 0;
     Object.keys(ten || {}).forEach(function (k) {
       var q = +k, t = ten[k];
       if (!(q >= van) || q > nu || q % Q || !t) return;
-      var a = arch[q];
-      if (!a) { arch[q] = { mi: 'onbalans_import', me: 'onbalans_export', ki: getal(t.ki) ? t.ki : null, ke: getal(t.ke) ? t.ke : null, v: !t.klaar || q + Q > nu, t: nu }; n++; return; }
+      var a = arch[q], tv = tenergyVast(t, q, nu);
+      if (!a) { arch[q] = { mi: 'onbalans_import', me: 'onbalans_export', ki: getal(t.ki) ? t.ki : null, ke: getal(t.ke) ? t.ke : null, v: !t.klaar || q + Q > nu, t: nu, ti: true, te: true, vi: tv && getal(t.ki), ve: tv && getal(t.ke) }; n++; return; }
       var g = false;
-      if (a.mi === 'onbalans_import' && !getal(a.ki) && getal(t.ki)) { a.ki = t.ki; g = true; }
-      if (a.me === 'onbalans_export' && !getal(a.ke) && getal(t.ke)) { a.ke = t.ke; g = true; }
+      // Ontbreekt de prijs, of kwam hij eerder (nog niet vastgesteld) van Tenergy: bijwerken.
+      if (a.mi === 'onbalans_import' && getal(t.ki) && (!getal(a.ki) || (a.ti && !a.vi))) { a.ki = t.ki; a.ti = true; a.vi = tv; g = true; }
+      if (a.me === 'onbalans_export' && getal(t.ke) && (!getal(a.ke) || (a.te && !a.ve))) { a.ke = t.ke; a.te = true; a.ve = tv; g = true; }
       if (g) n++;
     });
     return n;
@@ -534,15 +541,20 @@ function bembPage() {
     var arch = ((await lees(k(id, 'prijzen'))) || {}).rows || {};
     j.prices.forEach(function (p) {
       if (!p || !getal(p.start) || p.start % Q || p.carried) return;
-      p = Object.assign({}, p, { values: vulOnbalans(p.values, ten[p.start]) });
+      var orig = p.values || {}, t = ten[p.start], tv = tenergyVast(t, p.start, nu), af = p.start + Q <= nu;
+      p = Object.assign({}, p, { values: vulOnbalans(orig, t) });
       var keus = prijsKeuze(p, ctx, events, disc), oud = arch[p.start] || {};
       if (keus.ki === null && keus.ke === null && arch[p.start]) return; // BE gaf niets meer: vastgelegde prijs houden
       var tijdelijk = !!p.temporaryTariffs || (p.start <= nu && nu < p.start + Q);
+      var vanBEi = keus.ki !== null && getal(orig[keus.mi]), vanBEe = keus.ke !== null && getal(orig[keus.me]);
+      var houdI = keus.ki === null && oud.mi === keus.mi, houdE = keus.ke === null && oud.me === keus.me;
       arch[p.start] = {
         mi: keus.mi, me: keus.me,
-        ki: keus.ki !== null ? keus.ki : (oud.mi === keus.mi ? oud.ki : null),
-        ke: keus.ke !== null ? keus.ke : (oud.me === keus.me ? oud.ke : null),
-        v: !!p.provisional || tijdelijk, t: nu
+        ki: keus.ki !== null ? keus.ki : (houdI ? oud.ki : null),
+        ke: keus.ke !== null ? keus.ke : (houdE ? oud.ke : null),
+        v: !!p.provisional || tijdelijk, t: nu,
+        ti: keus.ki !== null ? !vanBEi : (houdI ? !!oud.ti : false), te: keus.ke !== null ? !vanBEe : (houdE ? !!oud.te : false),
+        vi: keus.ki !== null ? (vanBEi ? af : tv) : (houdI ? !!oud.vi : false), ve: keus.ke !== null ? (vanBEe ? af : tv) : (houdE ? !!oud.ve : false)
       };
     });
     tenergyAanvullen(arch, ten, nu, nu - 2 * 86400000);
@@ -627,16 +639,19 @@ function bembPage() {
   var LABEL = { onbalans_import: 'onbalans', afrr_import: 'aFRR', day_ahead_import: 'Dynamisch', day_ahead_afrr_import: 'Dynamisch + aFRR', onbalans_export: 'onbalans', afrr_export: 'aFRR' };
   async function allinPrijzen(id) {
     if (allinCache.id === id && Date.now() - allinCache.at < 120000) return allinCache.rows;
-    var bron = await leesAllinArchief(id), uit = {}, leeg = { authoritative: false, planned: new Set(), onbekend: function () { return false; } };
+    var bron = await leesAllinArchief(id), uit = {}, leeg = { authoritative: false, planned: new Set(), onbekend: function () { return false; } }, ten = tenergyCache(), nu = Date.now();
     ((bron && bron.rows) || []).forEach(function (p) {
       if (!p || !getal(p.start) || p.start % Q || p.carried) return;
-      var keus = prijsKeuze(p, leeg, new Set(), {}), ki = keus.ki, ke = keus.ke;
-      // Ontbrekende quote: laatste live-waarneming van dezelfde markt.
+      var keus = prijsKeuze(p, leeg, new Set(), {}), ki = keus.ki, ke = keus.ke, t = ten[p.start], af = p.start + Q <= nu;
+      // All-in kan aangevulde Tenergy-waarden in het archief bewaren: herken ze aan de cache.
+      var vi = getal(ki) && af && (t && keus.mi === 'onbalans_import' && ki === t.ki ? tenergyVast(t, p.start, nu) : true);
+      var ve = getal(ke) && af && (t && keus.me === 'onbalans_export' && ke === t.ke ? tenergyVast(t, p.start, nu) : true);
+      // Ontbrekende quote: laatste live-waarneming van dezelfde markt (niet vastgesteld).
       (Array.isArray(p.verloop) ? p.verloop : []).slice().reverse().forEach(function (o) {
-        if (!getal(ki) && keus.mi && o && o.marktImport === LABEL[keus.mi] && getal(o.ki)) ki = o.ki;
-        if (!getal(ke) && o && o.marktExport === LABEL[keus.me] && getal(o.ke)) ke = o.ke;
+        if (!getal(ki) && keus.mi && o && o.marktImport === LABEL[keus.mi] && getal(o.ki)) { ki = o.ki; vi = false; }
+        if (!getal(ke) && o && o.marktExport === LABEL[keus.me] && getal(o.ke)) { ke = o.ke; ve = false; }
       });
-      if (getal(ki) || getal(ke)) uit[p.start] = { ki: getal(ki) ? ki : null, ke: getal(ke) ? ke : null, mi: keus.mi, me: keus.me, v: p.provisional !== false, allin: true };
+      if (getal(ki) || getal(ke)) uit[p.start] = { ki: getal(ki) ? ki : null, ke: getal(ke) ? ke : null, mi: keus.mi, me: keus.me, v: p.provisional !== false, allin: true, vi: !!vi, ve: !!ve };
     });
     allinCache = { at: Date.now(), id: id, rows: uit };
     return uit;
@@ -647,15 +662,17 @@ function bembPage() {
     Object.keys(extra).forEach(function (q) { uit[q] = extra[q]; });
     Object.keys(eigen).forEach(function (q) {
       var a = eigen[q], b = uit[q];
-      uit[q] = !b ? a : { ki: getal(a.ki) ? a.ki : b.ki, ke: getal(a.ke) ? a.ke : b.ke, mi: a.mi, me: a.me, v: a.v && b.v };
+      // Per veld: vastgestelde prijs gaat voor; anders de eigen waarneming, dan All-in.
+      var kiesI = !b || (getal(a.ki) && (a.vi || !b.vi || !getal(b.ki))), kiesE = !b || (getal(a.ke) && (a.ve || !b.ve || !getal(b.ke)));
+      uit[q] = !b ? a : { ki: kiesI ? a.ki : b.ki, vi: kiesI ? !!a.vi : !!b.vi, ke: kiesE ? a.ke : b.ke, ve: kiesE ? !!a.ve : !!b.ve, mi: a.mi, me: a.me, v: a.v && b.v };
     });
     return uit;
   }
   function zetPrijzen(kw, prijzen) {
     Object.keys(kw).forEach(function (q) {
       var p = prijzen[q], x = kw[q];
-      if (!getal(x.pIn) && p) x.pIn = p.ki;
-      if (!getal(x.pUit) && p) x.pUit = p.ke;
+      if (!getal(x.pIn) && p) { x.pIn = p.ki; x.pInVast = !!p.vi; }
+      if (!getal(x.pUit) && p) { x.pUit = p.ke; x.pUitVast = !!p.ve; }
       if (p && p.v) x.prijsVoorlopig = true;
     });
     return kw;
@@ -665,7 +682,7 @@ function bembPage() {
     var kw = zetPrijzen(await cacheKwartieren(id, dk), await prijsIndex(id));
     Object.keys(kw).forEach(function (q) { if (+q >= eind) delete kw[q]; });
     var w = waardeer(kw, c, null);
-    return { dk: dk, bron: 'cache', kw: kw, w: w, eta: ETA, dekking: Math.min(1, w.accuSec / duur), prijsDekking: Math.min(1, w.prijsSec / duur) };
+    return { dk: dk, bron: 'cache', kw: kw, w: w, eta: ETA, dekking: Math.min(1, w.accuSec / duur), prijsDekking: Math.min(1, w.prijsSec / duur), kwal: Math.min(1, w.vastSec / duur) };
   }
   function parseDefinitief(j, rij, dk) {
     var lijst = j && j.day_detail && j.day_detail.intervals, g = grenzen(dk), out = {}, laden = 0, ontladen = 0, leegAccu = 0;
@@ -714,8 +731,9 @@ function bembPage() {
     Object.keys(kw).forEach(function (q) {
       var x = kw[q], b = bron[q] || {}, a = prijzen[q], bronIn = 'BE', bronUit = 'BE';
       x.pIn = prijsBetrouwbaar(b.pIn, b.imp) ? b.pIn : null; x.pUit = prijsBetrouwbaar(b.pUit, b.exp) ? b.pUit : null;
-      if (!getal(x.pIn) && a && getal(a.ki) && Math.abs(a.ki) <= MAX_KAAL) { x.pIn = a.ki; bronIn = a.allin ? 'markt/All-in' : 'markt'; if (a.v) x.prijsVoorlopig = true; }
-      if (!getal(x.pUit) && a && getal(a.ke) && Math.abs(a.ke) <= MAX_KAAL) { x.pUit = a.ke; bronUit = a.allin ? 'markt/All-in' : 'markt'; if (a.v) x.prijsVoorlopig = true; }
+      x.pInVast = getal(x.pIn); x.pUitVast = getal(x.pUit);
+      if (!getal(x.pIn) && a && getal(a.ki) && Math.abs(a.ki) <= MAX_KAAL) { x.pIn = a.ki; x.pInVast = !!a.vi; bronIn = a.allin ? 'markt/All-in' : 'markt'; if (a.v) x.prijsVoorlopig = true; }
+      if (!getal(x.pUit) && a && getal(a.ke) && Math.abs(a.ke) <= MAX_KAAL) { x.pUit = a.ke; x.pUitVast = !!a.ve; bronUit = a.allin ? 'markt/All-in' : 'markt'; if (a.v) x.prijsVoorlopig = true; }
       if (!getal(x.pIn) && getal(gemIn)) { x.pIn = gemIn; bronIn = 'daggemiddelde'; x.prijsGeschatIn = true; }
       if (!getal(x.pUit) && getal(gemUit)) { x.pUit = gemUit; bronUit = 'daggemiddelde'; x.prijsGeschatUit = true; }
       x.prijsBron = bronIn === bronUit ? bronIn : 'in ' + bronIn + ' / uit ' + bronUit;
@@ -761,7 +779,7 @@ function bembPage() {
    * Label achter elke dagnotitie: [BEMB v=… bron=ha|browser type=be|cache dekking=… actief=…]
    * 'actief' zet alleen Home Assistant (heartbeat, elke 15 min). */
   function maakLabel(bron, type, dekking, actief, kwal) {
-    return '[BEMB v=' + VERSIE + ' bron=' + bron + ' type=' + type + ' dekking=' + (100 * dekking).toFixed(1) + (type === 'be' && getal(kwal) ? ' kwal=' + (100 * kwal).toFixed(1) : '') + (actief ? ' actief=' + actief : '') + ']';
+    return '[BEMB v=' + VERSIE + ' bron=' + bron + ' type=' + type + ' dekking=' + (100 * dekking).toFixed(1) + (getal(kwal) ? ' kwal=' + (100 * kwal).toFixed(1) : '') + (actief ? ' actief=' + actief : '') + ']';
   }
   function leesLabel(note) {
     var m = typeof note === 'string' && /\[BEMB ([^\]]*)\]/.exec(note); if (!m) return null;
@@ -771,14 +789,11 @@ function bembPage() {
     var lab = leesLabel(bestaand && bestaand.note);
     if (!lab) return { mag: true, reden: '' };
     if (lab.type === 'be' && type !== 'be') return { mag: false, reden: 'definitieve versie staat er al' };
-    if (lab.type === 'be' && type === 'be') {
-      // Labels zonder kwal (vóór 1.2.2) tellen als 0: die mogen altijd worden verbeterd.
+    if (lab.type === type) {
+      // Zelfde soort: nauwkeurigheid (kwal) beslist — aandeel met eigen meting én vastgestelde prijs.
+      // Labels zonder kwal (vóór 1.2.5) tellen als 0: die mogen altijd worden verbeterd.
       var oudK = Number(lab.kwal); if (!isFinite(oudK)) oudK = 0;
-      if (oudK > 100 * (kwal || 0) + TOLERANTIE) return { mag: false, reden: 'bestaande definitieve versie is nauwkeuriger (' + oudK.toFixed(1) + '% tegen ' + (100 * (kwal || 0)).toFixed(1) + '%)' };
-    }
-    if (lab.type === 'cache' && type === 'cache') {
-      var oud = Number(lab.dekking); if (!isFinite(oud)) oud = 0;
-      if (oud > 100 * dekking + TOLERANTIE) return { mag: false, reden: 'bestaande versie heeft meer dekking (' + oud.toFixed(1) + '%)' };
+      if (oudK > 100 * (kwal || 0) + TOLERANTIE) return { mag: false, reden: 'bestaande versie is nauwkeuriger (' + oudK.toFixed(1) + '% tegen ' + (100 * (kwal || 0)).toFixed(1) + '%)' };
     }
     return { mag: true, reden: '' };
   }
@@ -788,8 +803,7 @@ function bembPage() {
     var lab = leesLabel(bestaand.note), t = r.bron === 'BE' ? 'be' : 'cache';
     if (!lab) return true;
     if (lab.type === 'cache' && t === 'be') return true;
-    if (lab.type === 'be' && t === 'be') { var o = Number(lab.kwal); if (!isFinite(o)) o = 0; return 100 * (r.kwal || 0) > o + 1; }
-    if (lab.type === 'cache' && t === 'cache') { var o2 = Number(lab.dekking); if (!isFinite(o2)) o2 = 0; return 100 * r.dekking > o2 + 1; }
+    if (lab.type === t) { var o = Number(lab.kwal); if (!isFinite(o)) o = 0; return 100 * (r.kwal || 0) > o + 1; }
     return false;
   }
   // Home Assistant actief? Jongste 'actief' in een label met bron=ha, max. 40 min oud.

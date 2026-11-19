@@ -47,7 +47,15 @@ Bij het instellen kies je of je eerst wilt proberen (**proefstand**, standaard u
 
 ## Prijzen
 
-Sinds 17-11-2026 geeft BE alleen nog voor een deel van de kwartieren een prijs. Ontbrekende onbalansprijzen vullen plugin en integratie aan met de publieke minuutprijzen van Tenergy, op dezelfde manier als Balansenergie All-in (per kwartier volgens de regeltoestand). BE gaat altijd voor. De plugin leest daarvoor de Tenergy-cache van All-in; de integratie haalt de pagina zelf elke minuut op.
+Afgerekend wordt op de settlementprijs per kwartier. Plugin en integratie bepalen die zoals het BE-dashboard (Balansenergie All-in):
+
+1. **BE stelt vast:** had de accu activiteit in een kwartier (actie of aFRR), dan levert BE na afloop de prijs van dat kwartier. Die gaat altijd voor.
+2. **Anders Tenergy:** zonder BE-prijs wordt de onbalansprijs na afloop van het kwartier bepaald uit de minuutprijzen van Tenergy, met de regeltoestand uit de activatiedata (alleen afregelen: laagste prijs; alleen opregelen: hoogste; beide: afname hoogste, teruglevering laagste).
+3. **Niet vastgesteld:** de activatiedata staat maar 30 minuten op Tenergy. Een kwartier dat niemand live heeft gevolgd, krijgt alleen de prijs van de laatste minuut. Die telt mee in de berekening, maar niet als vastgesteld.
+
+De plugin leest de Tenergy-cache van All-in; de integratie haalt Tenergy zelf elke minuut op.
+
+Per dag staat in het label `kwal`: het aandeel van de dag met eigen meting én vastgestelde prijs. Een versie met lagere `kwal` vervangt nooit een betere, en telt niet mee voor de heartbeat. Zo wint vanzelf de bron die de dag het best heeft gevolgd: de plugin als het dashboard open stond, HA als die doorliep.
 
 ## Samenwerking met de browserplugin
 
@@ -61,8 +69,7 @@ Beide zetten achter de notitie van elk dagrecord een label:
 - **Plugin past zich aan:** ziet de plugin een heartbeat van hooguit 40 minuten oud, dan verstuurt hij geen live meer en vult hij alleen nog dagen aan: dagen die er nog niet staan, of die hij duidelijk nauwkeuriger heeft (bijvoorbeeld van vóór de HA-installatie). De pagina toont dan "Home Assistant verstuurt". Is de heartbeat ouder, dan verstuurt de plugin weer alles zelf.
 - **Wie wint per dag:**
   - *definitief* (BE) gaat altijd voor *voorlopig*;
-  - *voorlopig* vervangt *voorlopig* alleen bij minstens gelijke meetdekking;
-  - *definitief* vervangt *definitief* alleen bij minstens gelijke nauwkeurigheid (`kwal`): het aandeel kwartieren waarvan de verdeling over huis en net uit eigen metingen komt en de prijs echt bekend is (niet het daggemiddelde). Zonder eigen metingen van een dag moet een verzender de BE-kwartieren schatten, en dat is minder nauwkeurig;
+  - zelfde soort vervangt alleen bij minstens gelijke nauwkeurigheid (`kwal`, zie Prijzen; bij definitieve dagen telt ook of de verdeling over huis en net uit eigen metingen komt);
   - zo vult de bron met de meeste meetdata een dag in.
 - **Eén live-verzender:** kan Home Assistant zijn heartbeat nergens kwijt (de plugin heeft alle recente dagen nauwkeuriger, bijvoorbeeld vlak na de installatie), dan verstuurt de plugin. Die zet dan elke 10 minuten zelf `actief=<tijd>` in zijn recentste dagrecord, met dezelfde waarden. Zolang die hartslag hooguit 25 minuten oud is, stuurt HA geen live; de status toont dan "browserplugin verstuurt". Sluit je het dashboard, dan neemt HA het binnen 25 minuten over. Zodra HA zelf volledige dagen heeft, wordt HA weer de vaste verzender.
 - **Proefstand:** in proefstand stuurt Home Assistant geen heartbeat, dus neemt de plugin niets over.
