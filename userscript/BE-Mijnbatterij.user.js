@@ -16,6 +16,7 @@
 // @grant        GM.getValue
 // @grant        GM.setValue
 // @connect      api.mijnbatterij.nl
+// @connect      publications.tennet.eu
 // ==/UserScript==
 
 /* ─── Brug naar api.mijnbatterij.nl (userscriptlaag) ─────────────────────
@@ -47,6 +48,57 @@
     if (typeof GM !== 'undefined' && GM && GM.setValue) { await GM.setValue(KEY, v); return; }
     throw new Error('Geen userscript-opslag beschikbaar');
   }
+  /* TenneT-publicatie van de settlementprijzen (openbaar, zonder sleutel): dezelfde data als de
+   * grafiek op tennet.eu/nl-en/settlement-prices-graph. Oracle APEX: eerst de pagina (sessie +
+   * beveiligde velden), dan de grafiekdata met dezelfde sessiecookie. Alleen lezen. */
+  var TENNET = 'https://publications.tennet.eu/ords/';
+  function gmReq(o) {
+    return new Promise(function (res) {
+      var fn = gmx(); if (!fn) { res({ fout: 'GM_xmlhttpRequest ontbreekt' }); return; }
+      fn(Object.assign({ timeout: 25000 }, o, {
+        onload: function (r) { res({ status: r.status, text: String(r.responseText || ''), headers: String(r.responseHeaders || '') }); },
+        onerror: function (r) { res({ fout: 'Netwerkfout richting TenneT' + (r && r.error ? ' (' + String(r.error).slice(0, 120) + ')' : '') }); },
+        ontimeout: function () { res({ fout: 'Timeout richting TenneT' }); }
+      }));
+    });
+  }
+  function htmlAttr(s) { return s.split('&#x2F;').join('/').split('&#x3D;').join('=').split('&quot;').join('"').split('&amp;').join('&'); }
+  async function tennetDag(datum) {
+    if (!/^\d{2}-\d{2}-\d{4}$/.test(datum)) return { ok: false, error: 'Ongeldige datum' };
+    var p = await gmReq({ method: 'GET', url: TENNET + 'f?p=100:90030:::::P90030_PTU_DATE_LOC:' + datum + '&p_lang=en', headers: { 'Accept': 'text/html' } });
+    if (p.fout) return { ok: false, error: p.fout };
+    if (p.status !== 200) return { ok: false, error: 'TenneT-pagina HTTP ' + p.status };
+    var h = p.text, bs = String.fromCharCode(92);
+    function veld(id) { var m = new RegExp('value="([^"]*)" id="' + id + '"').exec(h) || new RegExp('id="' + id + '"[^>]*value="([^"]*)"').exec(h); return m ? htmlAttr(m[1]) : null; }
+    var inst = veld('pInstance'), salt = veld('pSalt'), prot = veld('pPageItemsProtected');
+    var aj = /jetChart\.init\("R\d+"[\s\S]*?,"(UkVH[^"]+)"\)/.exec(h);
+    if (!inst || !salt || !prot || !aj || !/^\d+$/.test(inst)) return { ok: false, error: 'TenneT-pagina onherkenbaar (opbouw gewijzigd?)' };
+    var ajax = aj[1].split(bs + 'u002F').join('/');
+    // Sessiecookie meesturen: de browser doet dat meestal zelf; expliciet voor userscript-managers die dat niet doen.
+    var cookies = [];
+    p.headers.split(/\r?\n/).forEach(function (r) { var m = /^set-cookie:\s*([^=;\s]+=[^;]*)/i.exec(r); if (m) cookies.push(m[1]); });
+    var body = new URLSearchParams({ p_flow_id: '100', p_flow_step_id: '90030', p_instance: inst, p_debug: '', p_request: 'PLUGIN=' + ajax,
+      p_json: JSON.stringify({ pageItems: { itemsToSubmit: [{ n: 'P90030_PTU_DATE_LOC', v: datum }], protected: prot, rowVersion: '', formRegionChecksums: [] }, salt: salt }) }).toString();
+    var hd = { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' };
+    var o = { method: 'POST', url: TENNET + 'wwv_flow.ajax?p_context=aetherweb-2-0100/atr_06_chart/' + inst, headers: hd, data: body };
+    if (cookies.length) { hd.Cookie = cookies.join('; '); o.cookie = cookies.join('; '); }
+    var r = await gmReq(o);
+    if (r.fout) return { ok: false, error: r.fout };
+    var j; try { j = JSON.parse(r.text); } catch (e) { return { ok: false, error: 'TenneT gaf geen grafiekdata (HTTP ' + r.status + (/<html/i.test(r.text) ? ', sessie niet geaccepteerd' : '') + ')' }; }
+    if (!j || !Array.isArray(j.series)) return { ok: false, error: 'TenneT-antwoord zonder reeksen' };
+    // Per ISP-nummer: [tekort, overschot] in €/MWh.
+    var rijen = {};
+    j.series.forEach(function (s) {
+      var kol = s && s.name === 'Shortage' ? 0 : s && s.name === 'Surplus' ? 1 : -1;
+      if (kol < 0 || !Array.isArray(s.items)) return;
+      s.items.forEach(function (it) {
+        var m = it && /^\s*(\d{3})-\d{2}:\d{2}\s*$/.exec(String(it.name || ''));
+        if (!m || typeof it.value !== 'number' || !isFinite(it.value)) return;
+        (rijen[+m[1]] = rijen[+m[1]] || [null, null])[kol] = it.value;
+      });
+    });
+    return { ok: true, rijen: rijen };
+  }
   var GET_OK = /^\/api\/me$|^\/api\/results\/(?:daily|monthly)\?from=\d{4}-\d{2}(?:-\d{2})?&to=\d{4}-\d{2}(?:-\d{2})?$/;
   var POST_OK = /^\/api\/(?:live|results\/daily|results\/monthly)$/;
 
@@ -64,6 +116,7 @@
         if (nieuw && !/^[\x21-\x7e]{8,512}$/.test(nieuw)) { answer({ ok: false, error: 'Sleutel bevat ongeldige tekens' }); return; }
         await setKey(nieuw); answer({ ok: true, hasKey: !!nieuw }); return;
       }
+      if (v.op === 'tennet') { answer(await tennetDag(String(v.datum || ''))); return; }
       if (v.op !== 'api') return;
       var method = v.method === 'POST' ? 'POST' : 'GET';
       if (method === 'GET' ? !GET_OK.test(v.path) || v.body : !POST_OK.test(v.path) || !v.body) { answer({ ok: false, error: 'Verzoek niet toegestaan' }); return; }
@@ -113,7 +166,10 @@ function bembPage() {
   var RAUW_DAGEN = 10, PRIJS_DAGEN = 16, DAG_VENSTER = 10;
   var MIN_DEKKING_VOORLOPIG = 0.99; // voorlopige dag alleen bij (vrijwel) volledige metingen
   var coulombCache = { at: 0, id: '', rows: [] }, ARCHIEF_GAT = 300000;
-  var MAX_KAAL = 1.5, MIN_KWH = 0.05; // grenzen voor een bruikbare kale kwartierprijs (€/kWh)
+  var MAX_KAAL = 1.5, MIN_KWH = 0.05; // grenzen voor een bruikbare effectieve kwartierprijs (kosten/kWh, €/kWh)
+  // Settlementprijzen (BE market_breakdown, TenneT, vastgesteld archief) zijn echte marktprijzen en
+  // kunnen ver boven € 1,50 liggen (15-06-2026 09:45: € 3,50/kWh). Alleen een ruime plausibiliteitsgrens.
+  var MAX_SETTLE = 20;
 
   /* ── Tijd ── */
   var fmtDag = new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' });
@@ -354,11 +410,11 @@ function bembPage() {
       onbekend: function (s) { return w.some(function (x) { return s >= x[0] && s < x[1]; }); } };
   }
 
-  if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger, vulOnbalans: vulOnbalans, tenergyAanvullen: tenergyAanvullen, prijsKeuze: prijsKeuze, zetActief: zetActief, tenergyVast: tenergyVast, zetPrijzen: zetPrijzen, parseDefinitief: parseDefinitief, marktPrijs: marktPrijs, extraVelden: extraVelden, dagPayload: dagPayload }; return; }
+  if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger, vulOnbalans: vulOnbalans, tenergyAanvullen: tenergyAanvullen, prijsKeuze: prijsKeuze, zetActief: zetActief, tenergyVast: tenergyVast, zetPrijzen: zetPrijzen, parseDefinitief: parseDefinitief, marktPrijs: marktPrijs, extraVelden: extraVelden, dagPayload: dagPayload, metTennet: metTennet }; return; }
   // Diagnose (alleen als localStorage 'bemb_debug' = '1'): rekenfuncties en gegevens bereikbaar via window.__bemb.
   try {
     if (localStorage.getItem('bemb_debug') === '1') window.__bemb = Object.assign({ verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger, vulOnbalans: vulOnbalans, tenergyAanvullen: tenergyAanvullen, prijsKeuze: prijsKeuze, zetActief: zetActief, tenergyVast: tenergyVast, zetPrijzen: zetPrijzen, parseDefinitief: parseDefinitief, marktPrijs: marktPrijs, extraVelden: extraVelden, dagPayload: dagPayload }, {
-      cacheKwartieren: cacheKwartieren, haalDefinitief: haalDefinitief, prijsIndex: prijsIndex, klant: klant, dagDefinitief: dagDefinitief,
+      cacheKwartieren: cacheKwartieren, haalDefinitief: haalDefinitief, prijsIndex: prijsIndex, tennetPrijzen: tennetPrijzen, prijzenDag: prijzenDag, brug: brug, klant: klant, dagDefinitief: dagDefinitief,
       maandBron: maandBron, rijVan: rijVan, cfg: cfg, lees: lees, k: k, versie: VERSIE });
   } catch (e) {}
 
@@ -707,6 +763,49 @@ function bembPage() {
     });
     return uit;
   }
+  // TenneT-settlementprijzen (tekort/overschot per kwartier, gepubliceerd na afloop van de dag).
+  // Getoetst tegen BE's market_breakdown: tot op de cent gelijk aan wat BE als onbalans afrekent.
+  // Wereldwijd per dag bewaard (niet per klant). Alleen afgelopen dagen.
+  async function tennetPrijzen(dk, alleenCache) {
+    var g = grenzen(dk); if (!g || dk >= vandaag()) return {};
+    var sk = 'nl:tennet:' + dk, st = await lees(sk), nu = Date.now(), n = (g.eind - g.start) / Q;
+    if (st && st.v === 1 && (st.compleet || (alleenCache && st.rows) || nu - st.at < (st.rows ? 6 : 1) * 3600000)) return st.rows || {};
+    if (alleenCache) return (st && st.rows) || {};
+    var a; try { a = await brug({ op: 'tennet', datum: dk.slice(8, 10) + '-' + dk.slice(5, 7) + '-' + dk.slice(0, 4) }); } catch (e) { a = { ok: false, error: e.message }; }
+    if (!a || !a.ok) { noteer('TenneT-prijzen ' + dk + ': ' + ((a && a.error) || 'geen antwoord')); await schrijf(sk, { v: 1, at: nu, fout: (a && a.error) || 'geen antwoord' }); return {}; }
+    var rows = {}, c = 0;
+    Object.keys(a.rijen || {}).forEach(function (i) {
+      var isp = +i, r = a.rijen[i];
+      if (!(isp >= 1 && isp <= n) || !Array.isArray(r)) return;
+      var ki = getal(r[0]) && Math.abs(r[0] / 1000) <= MAX_SETTLE ? r[0] / 1000 : null, ke = getal(r[1]) && Math.abs(r[1] / 1000) <= MAX_SETTLE ? r[1] / 1000 : null;
+      if (ki === null && ke === null) return;
+      rows[g.start + (isp - 1) * Q] = { ki: ki, ke: ke }; if (ki !== null && ke !== null) c++;
+    });
+    // Een dag zonder (volledige) publicatie later opnieuw proberen; een complete dag verandert niet meer.
+    if (!c) { await schrijf(sk, { v: 1, at: nu, fout: 'nog niet gepubliceerd' }); return {}; }
+    await schrijf(sk, { v: 1, at: nu, rows: rows, compleet: c === n });
+    if (c < n) noteer('TenneT-prijzen ' + dk + ': ' + c + ' van ' + n + ' kwartieren gepubliceerd.');
+    return rows;
+  }
+  // Onbalansprijs uit het archief (of ontbrekend) vervangen door TenneT's vastgestelde prijs.
+  // Prijzen van een andere markt (day-ahead, aFRR) blijven staan: die zijn afgerekend zoals BE ze gaf.
+  function metTennet(prijzen, tn) {
+    var keys = Object.keys(tn || {}); if (!keys.length) return prijzen;
+    var uit = Object.assign({}, prijzen);
+    keys.forEach(function (q) {
+      var t = tn[q], a = uit[q];
+      var neemI = getal(t.ki) && (!a || !getal(a.ki) || ((a.mi === 'onbalans_import' || !a.mi) && (!a.vi || a.ti)));
+      var neemE = getal(t.ke) && (!a || !getal(a.ke) || ((a.me === 'onbalans_export' || !a.me) && (!a.ve || a.te)));
+      if (!neemI && !neemE) return;
+      var b = Object.assign({}, a || {});
+      if (neemI) { b.ki = t.ki; b.vi = true; b.ti = false; b.tnI = true; b.mi = 'onbalans_import'; }
+      if (neemE) { b.ke = t.ke; b.ve = true; b.te = false; b.tnE = true; b.me = 'onbalans_export'; }
+      b.v = !!(a && a.v) && !(neemI && neemE);
+      uit[q] = b;
+    });
+    return uit;
+  }
+  async function prijzenDag(id, dk, alleenCache) { return metTennet(await prijsIndex(id), await tennetPrijzen(dk, alleenCache)); }
   function zetPrijzen(kw, prijzen) {
     Object.keys(kw).forEach(function (q) {
       var p = prijzen[q], x = kw[q];
@@ -716,9 +815,9 @@ function bembPage() {
     });
     return kw;
   }
-  async function dagUitCache(id, dk, tot, c) {
+  async function dagUitCache(id, dk, tot, c, alleenCache) {
     var g = grenzen(dk), eind = Math.min(g.eind, tot || g.eind), duur = Math.max(1, (eind - g.start) / 1000);
-    var kw = zetPrijzen(await cacheKwartieren(id, dk), await prijsIndex(id));
+    var kw = zetPrijzen(await cacheKwartieren(id, dk), await prijzenDag(id, dk, alleenCache));
     Object.keys(kw).forEach(function (q) { if (+q >= eind) delete kw[q]; });
     var w = waardeer(kw, c, null);
     return { dk: dk, bron: 'cache', kw: kw, w: w, eta: ETA, dekking: Math.min(1, w.accuSec / duur), prijsDekking: Math.min(1, w.prijsSec / duur), kwal: Math.min(1, w.vastSec / duur) };
@@ -783,15 +882,15 @@ function bembPage() {
     Object.keys(kw).forEach(function (q) {
       var x = kw[q], b = bron[q] || {}, a = prijzen[q], bronIn = 'BE', bronUit = 'BE';
       // 1. settlementprijs uit market_breakdown; 2. effectieve prijs (alleen bij genoeg volume).
-      x.pIn = getal(b.mIn) && Math.abs(b.mIn) <= MAX_KAAL ? b.mIn : prijsBetrouwbaar(b.pIn, b.imp) ? b.pIn : null;
-      x.pUit = getal(b.mUit) && Math.abs(b.mUit) <= MAX_KAAL ? b.mUit : prijsBetrouwbaar(b.pUit, b.exp) ? b.pUit : null;
+      x.pIn = getal(b.mIn) && Math.abs(b.mIn) <= MAX_SETTLE ? b.mIn : prijsBetrouwbaar(b.pIn, b.imp) ? b.pIn : null;
+      x.pUit = getal(b.mUit) && Math.abs(b.mUit) <= MAX_SETTLE ? b.mUit : prijsBetrouwbaar(b.pUit, b.exp) ? b.pUit : null;
       x.pInVast = getal(x.pIn); x.pUitVast = getal(x.pUit);
-      if (!getal(x.pIn) && a && getal(a.ki) && Math.abs(a.ki) <= MAX_KAAL) { x.pIn = a.ki; x.pInVast = !!a.vi; bronIn = a.allin ? 'markt/All-in' : 'markt'; if (a.v) x.prijsVoorlopig = true; }
-      if (!getal(x.pUit) && a && getal(a.ke) && Math.abs(a.ke) <= MAX_KAAL) { x.pUit = a.ke; x.pUitVast = !!a.ve; bronUit = a.allin ? 'markt/All-in' : 'markt'; if (a.v) x.prijsVoorlopig = true; }
+      if (!getal(x.pIn) && a && getal(a.ki) && Math.abs(a.ki) <= (a.vi ? MAX_SETTLE : MAX_KAAL)) { x.pIn = a.ki; x.pInVast = !!a.vi; bronIn = a.tnI ? 'TenneT' : a.allin ? 'markt/All-in' : 'markt'; if (a.v) x.prijsVoorlopig = true; }
+      if (!getal(x.pUit) && a && getal(a.ke) && Math.abs(a.ke) <= (a.ve ? MAX_SETTLE : MAX_KAAL)) { x.pUit = a.ke; x.pUitVast = !!a.ve; bronUit = a.tnE ? 'TenneT' : a.allin ? 'markt/All-in' : 'markt'; if (a.v) x.prijsVoorlopig = true; }
       // Onbalans heeft buiten regeltoestand 2 één prijs voor tekort en overschot: zonder handel in de
       // ene richting is de onbalansprijs van de andere richting de beste benadering (niet vastgesteld).
-      if (!getal(x.pIn) && getal(b.imbUit) && Math.abs(b.imbUit) <= MAX_KAAL) { x.pIn = b.imbUit; x.pInVast = false; bronIn = 'onbalans (andere richting)'; }
-      if (!getal(x.pUit) && getal(b.imbIn) && Math.abs(b.imbIn) <= MAX_KAAL) { x.pUit = b.imbIn; x.pUitVast = false; bronUit = 'onbalans (andere richting)'; }
+      if (!getal(x.pIn) && getal(b.imbUit) && Math.abs(b.imbUit) <= MAX_SETTLE) { x.pIn = b.imbUit; x.pInVast = false; bronIn = 'onbalans (andere richting)'; }
+      if (!getal(x.pUit) && getal(b.imbIn) && Math.abs(b.imbIn) <= MAX_SETTLE) { x.pUit = b.imbIn; x.pUitVast = false; bronUit = 'onbalans (andere richting)'; }
       if (!getal(x.pIn) && getal(gemIn)) { x.pIn = gemIn; bronIn = 'daggemiddelde'; x.prijsGeschatIn = true; }
       if (!getal(x.pUit) && getal(gemUit)) { x.pUit = gemUit; bronUit = 'daggemiddelde'; x.prijsGeschatUit = true; }
       x.prijsBron = bronIn === bronUit ? bronIn : 'in ' + bronIn + ' / uit ' + bronUit;
@@ -803,10 +902,12 @@ function bembPage() {
     // Ontlaadt de accu naar huis, dan is de afname ~0 en BE's effectieve prijs
     // onbruikbaar. De marktprijs van dat kwartier is dan de juiste waardering.
     if (dk >= plusDagen(vandaag(), -1)) { try { await herstelPrijzenDag(id, dk, 6 * 3600000); } catch (e) { if (e.pauze) throw e; noteer('Prijzen ' + dk + ': ' + e.message); } }
-    if (d.ontbrekend > 4) throw Error(d.ontbrekend + ' kwartieren zonder accuwaarden, ook niet in eigen metingen');
-    var kw = kiesPrijzen(d.kw, bron, await prijsIndex(id), rij), w = waardeer(kw, c, c.afrr ? afrrVan(rij) : null);
+    // Kwartieren zonder accuwaarden bij BE (en zonder eigen metingen): parseDefinitief heeft al
+    // gecontroleerd dat BE's dagtotaal ze ook niet meetelt; we volgen BE en tellen ze als 0.
+    // Ze drukken de nauwkeurigheid (kwal) en staan in de notitie.
+    var kw = kiesPrijzen(d.kw, bron, await prijzenDag(id, dk), rij), w = waardeer(kw, c, c.afrr ? afrrVan(rij) : null);
     var duur = (grenzen(dk).eind - grenzen(dk).start) / 1000;
-    return { dk: dk, bron: 'BE', kw: kw, w: w, eta: ETA, dekking: Math.min(1, w.accuSec / duur), prijsDekking: Math.min(1, w.prijsSec / duur), uitCache: d.uitCache, geschat: d.geschat, aangevuld: d.aangevuld, kwal: kwaliteit(d, w) };
+    return { dk: dk, bron: 'BE', kw: kw, w: w, eta: ETA, dekking: Math.min(1, w.accuSec / duur), prijsDekking: Math.min(1, w.prijsSec / duur), uitCache: d.uitCache, geschat: d.geschat, aangevuld: d.aangevuld, ontbrekend: d.ontbrekend, kwal: kwaliteit(d, w) };
   }
   var maandCache = {};
   async function maandBron(id, ym, maxLeeftijd) {
@@ -910,8 +1011,9 @@ function bembPage() {
   }
   function dagPayload(r, c) {
     // Meer dan 2 uur met daggemiddelde prijs: geen kwartierwaardering meer, dus als onzeker markeren.
-    var w = r.w, invalid = r.bron === 'cache' ? (r.dekking < 0.99 || r.prijsDekking < 0.99 || w.zonderPrijs > 0) : (w.zonderPrijs > 0 || (w.geschattePrijs || 0) > 8);
-    var note = (r.bron === 'BE' ? 'BE definitief' + (r.aangevuld ? ', ' + r.aangevuld + ' kwartieren accuwaarden uit eigen metingen' : '') : 'Voorlopig uit browsercache, dekking ' + (100 * r.dekking).toFixed(1) + '%') +
+    var w = r.w, invalid = r.bron === 'cache' ? (r.dekking < 0.99 || r.prijsDekking < 0.99 || w.zonderPrijs > 0) : (w.zonderPrijs > 0 || (w.geschattePrijs || 0) > 8 || (r.ontbrekend || 0) > 4);
+    var note = (r.bron === 'BE' ? 'BE definitief' + (r.aangevuld ? ', ' + r.aangevuld + ' kwartieren accuwaarden uit eigen metingen' : '') +
+      (r.ontbrekend ? ', ' + r.ontbrekend + ' kwartieren zonder accudata bij BE (als 0, zoals BE\'s dagtotaal)' : '') : 'Voorlopig uit browsercache, dekking ' + (100 * r.dekking).toFixed(1) + '%') +
       (w.geschattePrijs ? '. ' + w.geschattePrijs + ' kwartieren met daggemiddelde prijs' : '') + '. All-in' + (c.saldeert ? ', EB op teruglevering t/m 2026' : ', zonder EB op teruglevering') +
       '. Besparing = ontladen naar huis minus evenredige laadkosten; handel = ontladen naar net minus evenredige laadkosten' +
       (r.bron === 'BE' && c.afrr ? ' plus aFRR-vergoeding' : '') + '. ' + etaTekst(r.eta || ETA) + '.';
@@ -1378,8 +1480,8 @@ function bembPage() {
           if (def && def.v === 3 && def.kw) {
             var dd = verdeelDefinitief(def.kw, await cacheKwartieren(id, dk), ETA);
             var defRij = null; try { defRij = JSON.parse(def.sig); } catch (e) {}
-            d = { bron: 'BE', dekking: 1, w: waardeer(kiesPrijzen(dd.kw, def.kw, await prijsIndex(id), defRij), c, c.afrr ? afrrVan(defRij) : null) };
-          } else d = await dagUitCache(id, dk, null, c);
+            d = { bron: 'BE', dekking: 1, w: waardeer(kiesPrijzen(dd.kw, def.kw, await prijzenDag(id, dk, true), defRij), c, c.afrr ? afrrVan(defRij) : null) };
+          } else d = await dagUitCache(id, dk, null, c, true);
         } catch (e) { d = null; }
         var st = await lees(k(id, (c.proef ? 'proef:' : 'sent:') + dk));
         var leeg = !d || (!d.w.accuSec && d.bron !== 'BE');
