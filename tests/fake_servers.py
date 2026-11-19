@@ -61,6 +61,36 @@ async def tenergy(req):
     feed = [{"Key": f"/Date({t})/", "Value": 120.0 + (t // 900000 % 3) * 10} for t in range(t0, nu, 60000)]
     data = {"ChartSeries": [{"Id": "PRICES_TAKE", "Data": take}, {"Id": "PRICES_FEED", "Data": feed}]}
     return web.Response(text=f"<script>data = {json.dumps(data)}; serialChart.updateChart(data, 1);</script>", content_type="text/html")
+tennet_log = []
+async def tennet_pagina(req):
+    """Nep-TenneT-publicatie (Oracle APEX): pagina met sessievelden en een sessiecookie."""
+    tennet_log.append(("pagina", req.query.get("p", "")))
+    html = ('<input type="hidden" name="p_instance" value="4960515031577" id="pInstance" />'
+            '<input type="hidden" value="40567796882410854816" id="pSalt" />'
+            '<input type="hidden" id="pPageItemsProtected" value="UDkwMDMw&#x2F;I20G-IQ" />'
+            '<script>apex.widget.jetChart.init("R84965069442921348","","400",(function( options ){ return options; }),false,true,null,'
+            '"UkVHSU9OIFRZUEV-fjg0OTY1\\u002FhbWo4jjG");</script>')
+    r = web.Response(text=html, content_type="text/html")
+    r.set_cookie("ORA_WWV_APP_100", "SESSIE123")
+    return r
+async def tennet_ajax(req):
+    import json
+    form = await req.post()
+    tennet_log.append(("ajax", req.headers.get("Cookie", "")))
+    if "ORA_WWV_APP_100=SESSIE123" not in req.headers.get("Cookie", "") or form.get("p_instance") != "4960515031577" \
+            or form.get("p_request") != "PLUGIN=UkVHSU9OIFRZUEV-fjg0OTY1/hbWo4jjG":
+        return web.Response(text="<!DOCTYPE html><html>sessie verlopen</html>", content_type="text/html")
+    pj = json.loads(form["p_json"])
+    d = pj["pageItems"]["itemsToSubmit"][0]["v"]
+    dk = f"{d[6:10]}-{d[3:5]}-{d[0:2]}"
+    items = {"Shortage": [], "Surplus": []}
+    if dk < calc.vandaag(int(time.time() * 1000)):
+        a, b = calc.grenzen(dk)
+        for i in range((b - a) // 900000):
+            naam = f" {i + 1:03d}-{(i // 4) % 24:02d}:{(i % 4) * 15:02d}"
+            items["Shortage"].append({"id": str(i), "value": 100.0 + i, "name": naam})
+            items["Surplus"].append({"id": str(200 + i), "value": -50.0 + i if i != 40 else 3500.0, "name": naam})
+    return web.json_response({"series": [{"name": k, "items": v} for k, v in items.items()]})
 async def results(req):
     ingelogd(req); be_log.append("results-" + req.query["interval"])
     per = req.query["period"]
@@ -97,6 +127,6 @@ def maak_app():
     app = web.Application()
     app.add_routes([web.get("/accounts/login/", login_get), web.post("/accounts/login/", login_post), web.get("/customer/", customer),
                     web.get("/customer/current-history/api/", history), web.get("/customer/current-prices/api/", prices),
-                    web.get("/customer/ABC123/results-v2-api/", results), web.get("/tenergy", tenergy),
+                    web.get("/customer/ABC123/results-v2-api/", results), web.get("/tenergy", tenergy), web.get("/ords/f", tennet_pagina), web.post("/ords/wwv_flow.ajax", tennet_ajax),
                     web.get("/api/me", mb_me), web.post("/api/live", mb_live), web.post("/api/results/daily", mb_daily_post), web.get("/api/results/daily", mb_daily_get)])
     return app

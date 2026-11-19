@@ -22,7 +22,10 @@ BTW = 1.21
 OPSLAG = 0.02
 # Energiebelasting excl. btw, schijf 1. Saldering eindigt op 1-1-2027.
 EB_EX = {2025: 0.10154, 2026: 0.09161, 2027: 0.08802}
-MAX_KAAL = 1.5   # €/kWh: daarboven is een kale kwartierprijs onbruikbaar
+MAX_KAAL = 1.5   # €/kWh: grens voor BE's effectieve kwartierprijs (kosten/kWh); daarboven onbruikbaar
+# Settlementprijzen (market_breakdown, TenneT, vastgesteld archief) zijn echte marktprijzen en liggen
+# geregeld boven € 1,50 (15-06-2026 09:45: € 3,50/kWh). Alleen een ruime grens tegen onzinwaarden.
+MAX_SETTLE = 100.0
 MIN_KWH = 0.05   # minimale netstroom voor een bruikbare effectieve prijs
 MIN_DEKKING_VOORLOPIG = 0.99  # voorlopige dag alleen bij (vrijwel) volledige metingen
 FLOWS = ("ontHuis", "ontNet", "ladNet", "ladPV")
@@ -175,7 +178,7 @@ def gat_grens(res_ms: float | None) -> float:
 
 def leeg_kwartier() -> dict[str, float]:
     return {"imp": 0.0, "exp": 0.0, "dek": 0.0, "ontHuis": 0.0, "ontNet": 0.0, "ladNet": 0.0, "ladPV": 0.0, "accuSec": 0.0,
-            "geladen": 0.0, "ontladen": 0.0}
+            "geladen": 0.0, "ontladen": 0.0, "pv": 0.0, "pvSec": 0.0, "load": 0.0, "loadSec": 0.0}
 
 
 def integreer_segment(kw: dict[int, dict], r: dict, n: dict, e: dict | None = None) -> None:
@@ -194,6 +197,13 @@ def integreer_segment(kw: dict[int, dict], r: dict, n: dict, e: dict | None = No
         else:
             c["exp"] += -r["po"] * uur / 1000
         c["dek"] += sec
+        # Zon = PV op de Balans-omvormer (p) + PV bij het huis (g); huis = l. Gecontroleerd: l ≈ po + bo(AC) + p + g.
+        if getal(r.get("p")) or getal(r.get("g")):
+            c["pv"] = c.get("pv", 0.0) + ((r["p"] if getal(r.get("p")) else 0) + (r["g"] if getal(r.get("g")) else 0)) * uur / 1000
+            c["pvSec"] = c.get("pvSec", 0.0) + sec
+        if getal(r.get("l")):
+            c["load"] = c.get("load", 0.0) + r["l"] * uur / 1000
+            c["loadSec"] = c.get("loadSec", 0.0) + sec
         if getal(r.get("bo")):
             # Verdeling en waardering in AC; geladen/ontladen blijven de gemeten DC-kWh.
             v = verdeel(r["po"], naar_ac(r["bo"], e))
@@ -501,6 +511,95 @@ def prijs_gaten(arch: dict[int, dict], start: int, tot: int) -> int:
     return mist
 
 
+# ── TenneT-settlementprijzen (gelijk aan de plugin) ─────────────────────
+# Openbare publicatie (Oracle APEX) achter tennet.eu/nl-en/settlement-prices-graph: per dag, na
+# afloop, de tekort- en overschotprijs per kwartier. Getoetst tegen BE's market_breakdown: tot op de
+# cent gelijk aan wat BE als onbalans afrekent.
+TENNET_URL = "https://publications.tennet.eu/ords/"
+
+
+def _html_attr(s: str) -> str:
+    return s.replace("&#x2F;", "/").replace("&#x3D;", "=").replace("&quot;", '"').replace("&amp;", "&")
+
+
+def tennet_pagina(html: str) -> dict:
+    """Sessie-instantie, salt, beveiligde velden en de ajax-sleutel van de grafiek uit de pagina."""
+    def veld(id_: str) -> str | None:
+        m = re.search(r'value="([^"]*)" id="' + id_ + '"', html) or re.search(r'id="' + id_ + r'"[^>]*value="([^"]*)"', html)
+        return _html_attr(m.group(1)) if m else None
+    inst, salt, prot = veld("pInstance"), veld("pSalt"), veld("pPageItemsProtected")
+    aj = re.search(r'jetChart\.init\("R\d+"[\s\S]*?,"(UkVH[^"]+)"\)', html)
+    if not inst or not salt or not prot or not aj or not inst.isdigit():
+        raise BronFout("TenneT-pagina onherkenbaar (opbouw gewijzigd?)")
+    return {"inst": inst, "salt": salt, "prot": prot, "ajax": aj.group(1).replace("\\u002F", "/")}
+
+
+def tennet_post(datum: str, pg: dict) -> dict[str, str]:
+    return {"p_flow_id": "100", "p_flow_step_id": "90030", "p_instance": pg["inst"], "p_debug": "",
+            "p_request": "PLUGIN=" + pg["ajax"],
+            "p_json": json.dumps({"pageItems": {"itemsToSubmit": [{"n": "P90030_PTU_DATE_LOC", "v": datum}],
+                                                "protected": pg["prot"], "rowVersion": "", "formRegionChecksums": []},
+                                  "salt": pg["salt"]}, separators=(",", ":"))}
+
+
+def tennet_rijen(j: Any) -> dict[int, list]:
+    """Grafiekdata → {ISP-nummer: [tekort, overschot]} in €/MWh."""
+    if not isinstance(j, dict) or not isinstance(j.get("series"), list):
+        raise BronFout("TenneT-antwoord zonder reeksen")
+    rijen: dict[int, list] = {}
+    for s in j["series"]:
+        kol = 0 if isinstance(s, dict) and s.get("name") == "Shortage" else 1 if isinstance(s, dict) and s.get("name") == "Surplus" else -1
+        if kol < 0 or not isinstance(s.get("items"), list):
+            continue
+        for it in s["items"]:
+            m = re.match(r"^\s*(\d{3})-\d{2}:\d{2}\s*$", str((it or {}).get("name", "")))
+            v = (it or {}).get("value")
+            if m and isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v):
+                rijen.setdefault(int(m.group(1)), [None, None])[kol] = float(v)
+    return rijen
+
+
+def tennet_kwartieren(dk: str, rijen: dict[int, list]) -> tuple[dict[int, dict], bool]:
+    """Per kwartierstart {ki, ke} in €/kWh; ISP n begint om dagstart + (n-1)·15 min (ook bij zomer-/wintertijd)."""
+    start, eind = grenzen(dk)
+    n = (eind - start) // Q
+    rows: dict[int, dict] = {}
+    volledig = 0
+    for isp, r in rijen.items():
+        if not 1 <= int(isp) <= n or not isinstance(r, list) or len(r) != 2:
+            continue
+        ki = r[0] / 1000 if getal(r[0]) and abs(r[0] / 1000) <= MAX_SETTLE else None
+        ke = r[1] / 1000 if getal(r[1]) and abs(r[1] / 1000) <= MAX_SETTLE else None
+        if ki is None and ke is None:
+            continue
+        rows[start + (int(isp) - 1) * Q] = {"ki": ki, "ke": ke}
+        if ki is not None and ke is not None:
+            volledig += 1
+    return rows, volledig == n
+
+
+def met_tennet(prijzen: dict[int, dict], tn: dict[int, dict]) -> dict[int, dict]:
+    """Onbalansprijs uit het archief (of ontbrekend) vervangen door TenneT's vastgestelde prijs.
+    Prijzen van een andere markt (day-ahead, aFRR) blijven staan: die zijn afgerekend zoals BE ze gaf."""
+    if not tn:
+        return prijzen
+    uit = dict(prijzen)
+    for q, t in tn.items():
+        a = uit.get(q)
+        neem_i = getal(t.get("ki")) and (not a or not getal(a.get("ki")) or (a.get("mi") in ("onbalans_import", None) and (not a.get("vi") or a.get("ti"))))
+        neem_e = getal(t.get("ke")) and (not a or not getal(a.get("ke")) or (a.get("me") in ("onbalans_export", None) and (not a.get("ve") or a.get("te"))))
+        if not neem_i and not neem_e:
+            continue
+        b = dict(a or {})
+        if neem_i:
+            b.update(ki=t["ki"], vi=True, ti=False, tnI=True, mi="onbalans_import")
+        if neem_e:
+            b.update(ke=t["ke"], ve=True, te=False, tnE=True, me="onbalans_export")
+        b["v"] = bool(a and a.get("v")) and not (neem_i and neem_e)
+        uit[q] = b
+    return uit
+
+
 def zet_prijzen(kw: dict[int, dict], prijzen: dict[int, dict]) -> dict[int, dict]:
     for q, x in kw.items():
         p = prijzen.get(q)
@@ -526,17 +625,25 @@ def kies_prijzen(kw: dict[int, dict], bron: dict[int, dict], prijzen: dict[int, 
     for q, x in kw.items():
         b, a = bron.get(q) or {}, prijzen.get(q)
         bin_, buit = "BE", "BE"
-        x["pIn"] = b.get("pIn") if prijs_betrouwbaar(b.get("pIn"), b.get("imp", 0)) else None
-        x["pUit"] = b.get("pUit") if prijs_betrouwbaar(b.get("pUit"), b.get("exp", 0)) else None
+        # 1. settlementprijs uit market_breakdown; 2. effectieve prijs (alleen bij genoeg volume).
+        mi, mu = b.get("mIn"), b.get("mUit")
+        x["pIn"] = mi if getal(mi) and abs(mi) <= MAX_SETTLE else (b.get("pIn") if prijs_betrouwbaar(b.get("pIn"), b.get("imp", 0)) else None)
+        x["pUit"] = mu if getal(mu) and abs(mu) <= MAX_SETTLE else (b.get("pUit") if prijs_betrouwbaar(b.get("pUit"), b.get("exp", 0)) else None)
         x["pInVast"], x["pUitVast"] = getal(x["pIn"]), getal(x["pUit"])
-        if not getal(x["pIn"]) and a and getal(a.get("ki")) and abs(a["ki"]) <= MAX_KAAL:
-            x["pIn"], x["pInVast"], bin_ = a["ki"], bool(a.get("vi")), "markt"
+        if not getal(x["pIn"]) and a and getal(a.get("ki")) and abs(a["ki"]) <= (MAX_SETTLE if a.get("vi") else MAX_KAAL):
+            x["pIn"], x["pInVast"], bin_ = a["ki"], bool(a.get("vi")), "TenneT" if a.get("tnI") else "markt"
             if a.get("v"):
                 x["prijsVoorlopig"] = True
-        if not getal(x["pUit"]) and a and getal(a.get("ke")) and abs(a["ke"]) <= MAX_KAAL:
-            x["pUit"], x["pUitVast"], buit = a["ke"], bool(a.get("ve")), "markt"
+        if not getal(x["pUit"]) and a and getal(a.get("ke")) and abs(a["ke"]) <= (MAX_SETTLE if a.get("ve") else MAX_KAAL):
+            x["pUit"], x["pUitVast"], buit = a["ke"], bool(a.get("ve")), "TenneT" if a.get("tnE") else "markt"
             if a.get("v"):
                 x["prijsVoorlopig"] = True
+        # Onbalans heeft buiten regeltoestand 2 één prijs voor tekort en overschot: zonder handel in de
+        # ene richting is de onbalansprijs van de andere richting de beste benadering (niet vastgesteld).
+        if not getal(x["pIn"]) and getal(b.get("imbUit")) and abs(b["imbUit"]) <= MAX_SETTLE:
+            x["pIn"], x["pInVast"], bin_ = b["imbUit"], False, "onbalans (andere richting)"
+        if not getal(x["pUit"]) and getal(b.get("imbIn")) and abs(b["imbIn"]) <= MAX_SETTLE:
+            x["pUit"], x["pUitVast"], buit = b["imbIn"], False, "onbalans (andere richting)"
         if not getal(x["pIn"]) and gem_in is not None:
             x["pIn"], bin_, x["prijsGeschatIn"] = gem_in, "daggemiddelde", True
         if not getal(x["pUit"]) and gem_uit is not None:
@@ -551,12 +658,29 @@ def waardeer(kw: dict[int, dict], saldeert: bool, afrr_eur: float | None) -> dic
     laadkosten worden naar rato van die kWh verdeeld."""
     t = {"ontHuis": 0.0, "ontNet": 0.0, "ladNet": 0.0, "ladPV": 0.0, "huis": 0.0, "net": 0.0, "kNet": 0.0,
          "kPV": 0.0, "imp": 0.0, "exp": 0.0, "geladen": 0.0, "ontladen": 0.0, "accuSec": 0.0, "prijsSec": 0.0,
-         "zonderPrijs": 0, "voorlopigePrijs": 0, "kwartieren": 0, "geschattePrijs": 0, "vastSec": 0, "onzeker": 0}
+         "zonderPrijs": 0, "voorlopigePrijs": 0, "kwartieren": 0, "geschattePrijs": 0, "vastSec": 0, "onzeker": 0,
+         "pv": 0.0, "pvExport": 0.0, "pvOnbekend": 0, "impKost": 0.0, "impMetPrijs": 0.0, "expOpbr": 0.0, "expMetPrijs": 0.0}
     for q in sorted(kw):
         x = kw[q]
         t["kwartieren"] += 1
         t["imp"] += x.get("imp") or 0
         t["exp"] += x.get("exp") or 0
+        # Zon: opgewekt, en wat daarvan naar het net ging (teruglevering die niet uit de accu kwam).
+        pv_k = x["pv"] if getal(x.get("pv")) and (not getal(x.get("pvSec")) or x["pvSec"] >= 0.9 * (x.get("dek") or 900)) else None
+        if pv_k is None:
+            t["pvOnbekend"] += 1
+        else:
+            t["pv"] += pv_k
+            t["pvExport"] += min(pv_k, max((x.get("exp") or 0) - (x.get("ontNet") or 0), 0))
+        # Gemiddelde all-in in- en verkoopprijs van het huishouden (gewogen naar afname/teruglevering).
+        pih = allin(x.get("pIn"), False, q, saldeert) if getal(x.get("pIn")) else None
+        peh = allin(x.get("pUit"), True, q, saldeert) if getal(x.get("pUit")) else None
+        if getal(pih) and (x.get("imp") or 0) > 0:
+            t["impKost"] += pih * x["imp"]
+            t["impMetPrijs"] += x["imp"]
+        if getal(peh) and (x.get("exp") or 0) > 0:
+            t["expOpbr"] += peh * x["exp"]
+            t["expMetPrijs"] += x["exp"]
         if not (x.get("accuSec", 0) > 0):
             continue
         sec = min(900, x["accuSec"])
@@ -624,6 +748,17 @@ def _ts(v: Any) -> float:
     return math.nan
 
 
+def markt_prijs(lijst: Any, markt: str | None = None) -> float | None:
+    """Volumegewogen prijs van de markttransacties in één richting (kaal, €/kWh); None als er geen zijn."""
+    v = e = 0.0
+    for x in lijst if isinstance(lijst, list) else []:
+        if isinstance(x, dict) and (not markt or x.get("market") == markt) and getal(x.get("volume_kwh")) \
+                and x["volume_kwh"] > 0 and getal(x.get("price_eur_per_kwh")):
+            v += x["volume_kwh"]
+            e += x["volume_kwh"] * x["price_eur_per_kwh"]
+    return e / v if v > 0 else None
+
+
 def parse_definitief(j: dict, rij: dict | None, dk: str) -> dict[int, dict]:
     lijst = ((j or {}).get("day_detail") or {}).get("intervals")
     start, eind = grenzen(dk)
@@ -654,14 +789,33 @@ def parse_definitief(j: dict, rij: dict | None, dk: str) -> dict[int, dict]:
         laden += bl
         ontladen += bo
         pi, pu = v.get("effective_import_price_eur_per_kwh"), v.get("effective_export_price_eur_per_kwh")
+        # Settlementprijs per kwartier uit market_breakdown (per markt, onafhankelijk van het volume);
+        # de effectieve prijs (kosten/kWh) blijft de reserve.
+        mb = v.get("market_breakdown") if isinstance(v.get("market_breakdown"), dict) and v["market_breakdown"].get("available") else None
+        sd, ld = v.get("solar_direct_kwh"), v.get("load_kwh")
         out[q] = {"imp": v["grid_import_kwh"], "exp": v["grid_export_kwh"], "laden": bl, "ontladen": bo, "leeg": leeg,
-                  "pIn": pi if getal(pi) else None, "pUit": pu if getal(pu) else None}
+                  "pIn": pi if getal(pi) else None, "pUit": pu if getal(pu) else None,
+                  "mIn": markt_prijs(mb.get("purchases")) if mb else None, "mUit": markt_prijs(mb.get("sales")) if mb else None,
+                  "imbIn": markt_prijs(mb.get("purchases"), "imbalance") if mb else None,
+                  "imbUit": markt_prijs(mb.get("sales"), "imbalance") if mb else None,
+                  "pv": sd if getal(sd) and sd >= 0 else None, "load": ld if getal(ld) and ld >= 0 else None}
     if len(out) != (eind - start) // Q:
         raise BronFout("Kwartieren dekken niet de hele dag")
     if rij and getal(rij.get("battery_charged_kwh")) and getal(rij.get("battery_discharged_kwh")) and (
             abs(laden - rij["battery_charged_kwh"]) > 0.15 or abs(ontladen - rij["battery_discharged_kwh"]) > 0.15):
         raise BronFout("Kwartieren sluiten niet aan op dagtotaal")
     return out
+
+
+def _fysiek(n: dict, v: dict) -> None:
+    """Fysieke grenzen per kwartier (BE rondt accu/huis/zon af op 0,1 kWh): de accu kan niet meer naar
+    het net leveren dan er werd teruggeleverd, en niet meer uit zon laden dan er opgewekt werd."""
+    ont, lad = n["ontHuis"] + n["ontNet"], n["ladNet"] + n["ladPV"]
+    n["ontNet"] = min(n["ontNet"], max(v["exp"], 0))
+    n["ontHuis"] = ont - n["ontNet"]
+    if getal(v.get("pv")):
+        n["ladPV"] = min(n["ladPV"], max(v["pv"], 0))
+        n["ladNet"] = lad - n["ladPV"]
 
 
 def verdeel_definitief(bron: dict[int, dict], cache: dict[int, dict] | None, e: dict | None = None) -> dict:
@@ -672,7 +826,7 @@ def verdeel_definitief(bron: dict[int, dict], cache: dict[int, dict] | None, e: 
         # BE-kwartier zonder accuwaarden: aanvullen uit eigen metingen, anders als ongemeten tellen.
         if v.get("leeg"):
             m = {"imp": v["imp"], "exp": v["exp"], "accuSec": 0, "ladNet": 0.0, "ladPV": 0.0, "ontHuis": 0.0,
-                 "ontNet": 0.0, "geladen": 0.0, "ontladen": 0.0}
+                 "ontNet": 0.0, "geladen": 0.0, "ontladen": 0.0, "pv": v.get("pv"), "load": v.get("load")}
             if c and c.get("accuSec", 0) >= 810:
                 for f in FLOWS:
                     m[f] = c[f]
@@ -691,7 +845,8 @@ def verdeel_definitief(bron: dict[int, dict], cache: dict[int, dict] | None, e: 
         # BE-kWh zijn DC; omrekenen naar AC met het rendement bij het kwartiergemiddelde vermogen.
         lad_ac = -naar_ac(-v["laden"] * 4000, e) / 4000
         ont_ac = naar_ac(v["ontladen"] * 4000, e) / 4000
-        n = {"imp": v["imp"], "exp": v["exp"], "accuSec": 900, "geladen": v["laden"], "ontladen": v["ontladen"]}
+        n = {"imp": v["imp"], "exp": v["exp"], "accuSec": 900, "geladen": v["laden"], "ontladen": v["ontladen"],
+             "pv": v.get("pv"), "load": v.get("load")}
         if c and getal(c.get("soc")):
             n["soc"] = c["soc"]
         if c and c.get("accuSec", 0) >= 810 and (cl > 0 or v["laden"] == 0) and (co > 0 or v["ontladen"] == 0):
@@ -700,7 +855,21 @@ def verdeel_definitief(bron: dict[int, dict], cache: dict[int, dict] | None, e: 
             n["ontHuis"] = ont_ac * c["ontHuis"] / co if co else 0.0
             n["ontNet"] = ont_ac - n["ontHuis"]
             uit_cache += 1
+            if not getal(n.get("pv")) and c.get("pvSec", 0) >= 810:
+                n["pv"] = c["pv"]
+        elif v["laden"] > 0 and v["ontladen"] > 0 and getal(v.get("load")) and getal(v.get("pv")):
+            # Laden én ontladen in één kwartier: volgorde onbekend. Verdeel met BE's huisverbruik en zon:
+            # ontladen dekt eerst de huisvraag na zon, laden komt eerst uit het zonne-overschot.
+            vraag, over = max(v["load"] - v["pv"], 0.0), max(v["pv"] - v["load"], 0.0)
+            n["ontHuis"] = min(ont_ac, vraag)
+            n["ontNet"] = ont_ac - n["ontHuis"]
+            n["ladPV"] = min(lad_ac, over)
+            n["ladNet"] = lad_ac - n["ladPV"]
+            geschat += 1
+            geschat_actief += 1
+            _fysiek(n, v)
         else:
+            # Eén richting in het kwartier: uit de netstromen volgt de verdeling exact (op kwartierniveau).
             netto = ont_ac - lad_ac
             if abs(netto) < 1e-9:
                 netto = 0.0
@@ -710,7 +879,9 @@ def verdeel_definitief(bron: dict[int, dict], cache: dict[int, dict] | None, e: 
             n["ontHuis"] = min(ont, max(rest, 0.0))
             n["ontNet"] = ont - n["ontHuis"]
             geschat += 1
-            if v["laden"] > 0 or v["ontladen"] > 0:
+            _fysiek(n, v)
+            # Onzeker alleen als er in hetzelfde kwartier ook laden+ontladen of afname+teruglevering was.
+            if (v["laden"] > 0 and v["ontladen"] > 0) or ((v["laden"] > 0 or v["ontladen"] > 0) and v["imp"] > 0.02 and v["exp"] > 0.02):
                 geschat_actief += 1
         uit[q] = n
     return {"kw": uit, "n": len(bron), "uitCache": uit_cache, "geschat": geschat, "geschatActief": geschat_actief,
@@ -773,17 +944,30 @@ def dag_payload(r: dict, saldeert: bool, afrr: bool, versie: str, bron_label: st
         invalid = r["dekking"] < 0.99 or r["prijsDekking"] < 0.99 or w["zonderPrijs"] > 0
         kop = ("Voorlopig uit HA-metingen" if bron_label == "ha" else "Voorlopig uit browsercache") + f", dekking {to_fixed(100 * r['dekking'], 1)}%"
     else:
-        invalid = w["zonderPrijs"] > 0 or (w.get("geschattePrijs") or 0) > 8
-        kop = "BE definitief" + (f", {r['aangevuld']} kwartieren accuwaarden uit eigen metingen" if r.get("aangevuld") else "")
+        invalid = w["zonderPrijs"] > 0 or (w.get("geschattePrijs") or 0) > 8 or (r.get("ontbrekend") or 0) > 4
+        kop = ("BE definitief" + (f", {r['aangevuld']} kwartieren accuwaarden uit eigen metingen" if r.get("aangevuld") else "")
+               + (f", {r['ontbrekend']} kwartieren zonder accudata bij BE (als 0, zoals BE's dagtotaal)" if r.get("ontbrekend") else ""))
     note = (kop + (f". {w['geschattePrijs']} kwartieren met daggemiddelde prijs" if w.get("geschattePrijs") else "")
             + ". All-in" + (", EB op teruglevering t/m 2026" if saldeert else ", zonder EB op teruglevering")
             + ". Besparing = ontladen naar huis minus evenredige laadkosten; handel = ontladen naar net minus evenredige laadkosten"
             + (" plus aFRR-vergoeding" if r["bron"] == "BE" and afrr else "") + ". " + eta_tekst(r.get("eta") or ETA_STANDAARD) + ".")
     label = maak_label(versie, bron_label, "be" if r["bron"] == "BE" else "cache", r["dekking"], actief, r.get("kwal"))
     note = note[: 480 - len(label) - 1] + " " + label
-    return {"date": r["dk"], "batteryResult": e2(w["totaal"]), "batterySavings": e2(w["besparing"]),
-            "chargedToday": k3(w["geladen"]), "dischargedToday": k3(w["ontladen"]), "invalid": bool(invalid),
-            "note": note, "intervals": intervallen(r["kw"])}
+    return extra_velden(w, {"date": r["dk"], "batteryResult": e2(w["totaal"]), "batterySavings": e2(w["besparing"]),
+                            "chargedToday": k3(w["geladen"]), "dischargedToday": k3(w["ontladen"]), "invalid": bool(invalid),
+                            "note": note, "intervals": intervallen(r["kw"])})
+
+
+def extra_velden(w: dict, p: dict) -> dict:
+    """Zon en gemiddelde prijzen; alleen als ze volledig bekend zijn (anders liever weglaten dan fout)."""
+    if not w.get("pvOnbekend") and w.get("kwartieren"):
+        p["solarKwhGenerated"] = k3(w["pv"])
+        p["solarKwhConsumed"] = k3(max(w["pv"] - w["pvExport"], 0))
+    if w["imp"] > 0.01 and w["impMetPrijs"] >= 0.99 * w["imp"]:
+        p["avgBuyPrice"] = to_fixed(w["impKost"] / w["impMetPrijs"], 4)
+    if w["exp"] > 0.01 and w["expMetPrijs"] >= 0.99 * w["exp"]:
+        p["avgSellPrice"] = to_fixed(w["expOpbr"] / w["expMetPrijs"], 4)
+    return p
 
 
 def payload_hash(p: dict) -> str:

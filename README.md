@@ -34,7 +34,7 @@ Bij het instellen kies je of je eerst wilt proberen (**proefstand**, standaard u
 - **Sensoren:** resultaat, handel en besparing vandaag; geladen en ontladen vandaag; SOC; meetdekking; laatste live-verzending; status. De status bevat de activiteitenlog en de verstuurde dagen als attributen.
 - **Knop:** *Nu versturen*.
 - **Service:** `be_mijnbatterij.historie_herstellen` met `vanaf: "2026-08"`. Deze stuurt alle definitieve BE-dagen vanaf die maand opnieuw en vervangt de maandtotalen van volledig berekende maanden (ook handmatig ingevulde). De actie start de historie in de achtergrond en keert direct terug; de voortgang staat in de activiteit van de status-sensor en aan het eind volgt een melding. Tussen BE-verzoeken zit dan 4 seconden (de plugin doet hetzelfde), en een dag die op Mijnbatterij nauwkeuriger staat, wordt niet overschreven.
-- **Hoe compleet is de historie:** geladen/ontladen kWh komen exact uit BE. Voor dagen zonder eigen metingen en prijsarchief (ouder dan ongeveer een maand) wordt de verdeling over huis en net per kwartier geschat en valt de prijs waar BE's eigen prijs onbruikbaar is terug op het daggemiddelde. De besparing valt daardoor eerder te laag dan te hoog uit; zulke dagen krijgen een lage `kwal` en bij meer dan 8 geschatte kwartieren `invalid`.
+- **Hoe compleet is de historie:** geladen/ontladen kWh komen exact uit BE, de settlementprijzen per kwartier uit BE en TenneT (zie hieronder). Voor dagen zonder eigen metingen (ouder dan ongeveer een maand) wordt de verdeling over huis en net geschat in kwartieren waarin de accu zowel laadde als ontlaadde. De besparing valt daardoor eerder te laag dan te hoog uit; zulke dagen krijgen een lage `kwal` en bij meer dan 8 geschatte kwartieren `invalid`.
 
 ## Rekenregels
 
@@ -44,7 +44,7 @@ Bij het instellen kies je of je eerst wilt proberen (**proefstand**, standaard u
 - **batteryResult** = handel + besparing. Mijnbatterij leidt de handel daaruit af.
 - **Omvormerrendement:** BE meet het accuvermogen aan de DC-kant. Gewaardeerd wordt de AC-kant: ontladen levert DC × η-uit, laden kost DC ÷ η-in. η wordt per installatie en per vermogensklasse gemeten op momenten zonder PV, want dan geldt exact: accu AC = verbruik − net. Gemeten op 19-11-2026: ontladen 0,88–0,95, laden 0,96 (rondgang ≈ 0,87). De geladen en ontladen kWh richting Mijnbatterij blijven de DC-waarden, zoals BE ze rapporteert.
 - **All-in prijs:** kale BE-prijs × 1,21 ± € 0,02 opslag, plus energiebelasting op afname. Tot en met 2026 komt de EB ook terug op teruglevering (saldering).
-- **Prijs per kwartier:** de effectieve kwartierprijs van BE, als die betrouwbaar is (minstens 0,05 kWh netstroom en hooguit € 1,50/kWh kaal). Anders de vastgelegde marktprijs (onbalans, aFRR of day-ahead). Alleen als laatste redmiddel het daggemiddelde; een dag met meer dan 2 uur daggemiddelde gaat als `invalid` mee.
+- **Prijs per kwartier:** de settlementprijs uit BE's market_breakdown; anders de effectieve kwartierprijs van BE als die betrouwbaar is (minstens 0,05 kWh netstroom en hooguit € 1,50/kWh kaal — die grens geldt alleen voor deze kosten/kWh-deling, niet voor settlementprijzen, die geregeld € 4–5/kWh halen). Anders de vastgelegde marktprijs (onbalans via TenneT, aFRR of day-ahead). Alleen als laatste redmiddel het daggemiddelde; een dag met meer dan 2 uur daggemiddelde gaat als `invalid` mee.
 
 ## Prijzen
 
@@ -53,6 +53,7 @@ Afgerekend wordt op de settlementprijs per kwartier. Plugin en integratie bepale
 1. **BE stelt vast:** had de accu activiteit in een kwartier (actie of aFRR), dan levert BE na afloop de prijs van dat kwartier. Die gaat altijd voor.
 2. **Anders Tenergy:** zonder BE-prijs wordt de onbalansprijs na afloop van het kwartier bepaald uit de minuutprijzen van Tenergy, met de regeltoestand uit de activatiedata (alleen afregelen: laagste prijs; alleen opregelen: hoogste; beide: afname hoogste, teruglevering laagste).
 3. **Niet vastgesteld:** de activatiedata staat maar 30 minuten op Tenergy. Een kwartier dat niemand live heeft gevolgd, krijgt alleen de prijs van de laatste minuut. Die telt mee in de berekening, maar niet als vastgesteld.
+4. **Na afloop van de dag: TenneT.** TenneT publiceert per dag de tekort- en overschotprijs van elk kwartier ([settlement prices](https://www.tennet.eu/nl-en/settlement-prices-graph), openbaar, zonder sleutel). Getoetst tegen BE's afrekening: tot op de cent gelijk. Voor afgelopen dagen vervangt die elke niet-vastgestelde of ontbrekende onbalansprijs; day-ahead- en aFRR-prijzen van BE blijven staan. Daarmee is ook de historie volledig vastgesteld geprijsd.
 
 De plugin leest de Tenergy-cache van All-in; de integratie haalt Tenergy zelf elke minuut op.
 

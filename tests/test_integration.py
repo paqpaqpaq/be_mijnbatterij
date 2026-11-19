@@ -26,6 +26,7 @@ async def server(socket_enabled, monkeypatch):
     monkeypatch.setattr(aiohttp, "CookieJar", lambda **kw: echte(unsafe=True, **kw))
     api.BE_BASE = api.MB_BASE = f"http://127.0.0.1:{srv.port}"
     monkeypatch.setattr(calc, "TENERGY_URL", f"http://127.0.0.1:{srv.port}/tenergy")
+    monkeypatch.setattr(calc, "TENNET_URL", f"http://127.0.0.1:{srv.port}/ords/")
     yield srv
     await srv.close()
 
