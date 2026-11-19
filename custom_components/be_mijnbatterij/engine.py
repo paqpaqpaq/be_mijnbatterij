@@ -234,7 +234,8 @@ class Engine:
         start, eind = calc.grenzen(dk)
         duur = (eind - start) / 1000
         return {"dk": dk, "bron": "BE", "kw": kw, "w": w, "eta": self.eta, "dekking": min(1.0, w["accuSec"] / duur),
-                "prijsDekking": min(1.0, w["prijsSec"] / duur), "aangevuld": d["aangevuld"]}
+                "prijsDekking": min(1.0, w["prijsSec"] / duur), "aangevuld": d["aangevuld"],
+                "kwal": calc.kwaliteit(d, w)}
 
     async def bepaal_dag(self, dk: str, maand_j: dict | None, force: bool, rapport: list[str]) -> dict | None:
         rij = next((r for r in (maand_j or {}).get("series", []) if isinstance(r, dict) and r.get("date") == dk), None)
@@ -270,7 +271,7 @@ class Engine:
 
     async def _verstuur_dag(self, r: dict, bestaand: dict | None, rapport: list[str], actief: str | None = None) -> bool:
         type_ = "be" if r["bron"] == "BE" else "cache"
-        mag, reden = calc.mag_overschrijven(bestaand, type_, r["dekking"])
+        mag, reden = calc.mag_overschrijven(bestaand, type_, r["dekking"], r.get("kwal"))
         if not mag:
             rapport.append(f"{r['dk']}: niet vervangen — {reden}.")
             return False
@@ -343,7 +344,7 @@ class Engine:
                 r = await self.bepaal_dag(dk, maand_j, False, [])
                 if not r:
                     continue
-                mag, _ = calc.mag_overschrijven(bestaand.get(dk), "be" if r["bron"] == "BE" else "cache", r["dekking"])
+                mag, _ = calc.mag_overschrijven(bestaand.get(dk), "be" if r["bron"] == "BE" else "cache", r["dekking"], r.get("kwal"))
                 if not mag:
                     continue
                 await self._verstuur_dag(r, bestaand.get(dk), [], actief=calc.iso_ams(nu))

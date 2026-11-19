@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BE Mijnbatterij
 // @namespace    paq.balansenergie
-// @version      1.2.1
+// @version      1.2.2
 // @description  Deelt accuresultaten van het Balans Energie-dashboard met mijnbatterij.nl, gesplitst in handel en besparing. Los van Balansenergie All-in; eigen pagina in het menu.
 // @homepageURL  https://github.com/paqpaqpaq/be_mijnbatterij
 // @updateURL    https://raw.githubusercontent.com/paqpaqpaq/be_mijnbatterij/main/userscript/BE-Mijnbatterij.user.js
@@ -77,7 +77,7 @@
         poging++;
         fn({
           method: method, url: API + v.path, timeout: 25000,
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.2.1' },
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.2.2' },
           data: v.body ? JSON.stringify(v.body) : undefined,
           onload: function (r) {
             var ok = r.status >= 200 && r.status < 300, text = String(r.responseText || '');
@@ -103,7 +103,7 @@ function bembPage() {
   if (window.__bembLoaded) return;
   window.__bembLoaded = true;
 
-  var VERSIE = '1.2.1', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
+  var VERSIE = '1.2.2', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
   var BTW = 1.21, OPSLAG = 0.02;
   // Energiebelasting excl. btw, schijf 1. Saldering eindigt op 1-1-2027.
   var EB_EX = { 2025: 0.10154, 2026: 0.09161, 2027: 0.08802 };
@@ -261,7 +261,7 @@ function bembPage() {
   // Complete BE-kwartieren: bruto kWh van BE, verdeling uit de eigen cache
   // als die het kwartier goed dekt, anders uit de netto accubeweging.
   function verdeelDefinitief(bron, cache, e) {
-    var uit = {}, uitCache = 0, geschat = 0, aangevuld = 0, ontbrekend = 0;
+    var uit = {}, uitCache = 0, geschat = 0, geschatActief = 0, aangevuld = 0, ontbrekend = 0;
     Object.keys(bron).forEach(function (q) {
       var v = bron[q], c = cache && cache[q];
       // BE-kwartier zonder accuwaarden: aanvullen uit eigen metingen, anders als ongemeten tellen.
@@ -285,10 +285,18 @@ function bembPage() {
         var ont = Math.max(netto, 0), lad = Math.max(-netto, 0), rest = v.imp - v.exp + netto;
         n.ladPV = Math.min(lad, Math.max(-rest, 0)); n.ladNet = lad - n.ladPV;
         n.ontHuis = Math.min(ont, Math.max(rest, 0)); n.ontNet = ont - n.ontHuis; geschat++;
+        if (v.laden > 0 || v.ontladen > 0) geschatActief++;
       }
       uit[q] = n;
     });
-    return { kw: uit, uitCache: uitCache, geschat: geschat, aangevuld: aangevuld, ontbrekend: ontbrekend };
+    return { kw: uit, n: Object.keys(bron).length, uitCache: uitCache, geschat: geschat, geschatActief: geschatActief, aangevuld: aangevuld, ontbrekend: ontbrekend };
+  }
+  // Nauwkeurigheid van een definitieve dag (0–1): aandeel kwartieren met verdeling uit eigen
+  // metingen en een echte prijs. Bepaalt welke verzender een BE-dag mag vervangen.
+  function kwaliteit(d, w) {
+    var n = d.n || 0; if (!n) return 0;
+    var slecht = d.geschatActief + d.ontbrekend + (w.geschattePrijs || 0) + (w.zonderPrijs || 0);
+    return Math.max(0, Math.min(1, (n - slecht) / n));
   }
   function prijsKeuze(p, ctx, events, disc) {
     var state = ctx.authoritative ? (ctx.planned.has(p.start) ? 'planned' : ctx.onbekend(p.start) ? 'unavailable' : 'none')
@@ -308,7 +316,7 @@ function bembPage() {
       onbekend: function (s) { return w.some(function (x) { return s >= x[0] && s < x[1]; }); } };
   }
 
-  if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven }; return; }
+  if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger }; return; }
 
   /* ── Installatie en instellingen ── */
   function geldig(id) { return !!id && /^[A-Za-z0-9_-]+$/.test(id) && !/^(?:account|results|current-history|current-prices|undefined|null)$/i.test(id); }
@@ -686,7 +694,7 @@ function bembPage() {
     if (d.ontbrekend > 4) throw Error(d.ontbrekend + ' kwartieren zonder accuwaarden, ook niet in eigen metingen');
     var kw = kiesPrijzen(d.kw, bron, await prijsIndex(id), rij), w = waardeer(kw, c, c.afrr ? afrrVan(rij) : null);
     var duur = (grenzen(dk).eind - grenzen(dk).start) / 1000;
-    return { dk: dk, bron: 'BE', kw: kw, w: w, eta: ETA, dekking: Math.min(1, w.accuSec / duur), prijsDekking: Math.min(1, w.prijsSec / duur), uitCache: d.uitCache, geschat: d.geschat, aangevuld: d.aangevuld };
+    return { dk: dk, bron: 'BE', kw: kw, w: w, eta: ETA, dekking: Math.min(1, w.accuSec / duur), prijsDekking: Math.min(1, w.prijsSec / duur), uitCache: d.uitCache, geschat: d.geschat, aangevuld: d.aangevuld, kwal: kwaliteit(d, w) };
   }
   var maandCache = {};
   async function maandBron(id, ym, maxLeeftijd) {
@@ -716,22 +724,37 @@ function bembPage() {
   /* ── Afstemming met de Home Assistant-integratie (gelijk aan calc.py) ──
    * Label achter elke dagnotitie: [BEMB v=… bron=ha|browser type=be|cache dekking=… actief=…]
    * 'actief' zet alleen Home Assistant (heartbeat, elke 15 min). */
-  function maakLabel(bron, type, dekking, actief) {
-    return '[BEMB v=' + VERSIE + ' bron=' + bron + ' type=' + type + ' dekking=' + (100 * dekking).toFixed(1) + (actief ? ' actief=' + actief : '') + ']';
+  function maakLabel(bron, type, dekking, actief, kwal) {
+    return '[BEMB v=' + VERSIE + ' bron=' + bron + ' type=' + type + ' dekking=' + (100 * dekking).toFixed(1) + (type === 'be' && getal(kwal) ? ' kwal=' + (100 * kwal).toFixed(1) : '') + (actief ? ' actief=' + actief : '') + ']';
   }
   function leesLabel(note) {
     var m = typeof note === 'string' && /\[BEMB ([^\]]*)\]/.exec(note); if (!m) return null;
     var o = {}; m[1].split(/\s+/).forEach(function (x) { var i = x.indexOf('='); if (i > 0) o[x.slice(0, i)] = x.slice(i + 1); }); return o;
   }
-  function magOverschrijven(bestaand, type, dekking) {
+  function magOverschrijven(bestaand, type, dekking, kwal) {
     var lab = leesLabel(bestaand && bestaand.note);
     if (!lab) return { mag: true, reden: '' };
     if (lab.type === 'be' && type !== 'be') return { mag: false, reden: 'definitieve versie staat er al' };
+    if (lab.type === 'be' && type === 'be') {
+      // Labels zonder kwal (vóór 1.2.2) tellen als 0: die mogen altijd worden verbeterd.
+      var oudK = Number(lab.kwal); if (!isFinite(oudK)) oudK = 0;
+      if (oudK > 100 * (kwal || 0) + 0.05) return { mag: false, reden: 'bestaande definitieve versie is nauwkeuriger (' + oudK.toFixed(1) + '% tegen ' + (100 * (kwal || 0)).toFixed(1) + '%)' };
+    }
     if (lab.type === 'cache' && type === 'cache') {
       var oud = Number(lab.dekking); if (!isFinite(oud)) oud = 0;
       if (oud > 100 * dekking + 0.05) return { mag: false, reden: 'bestaande versie heeft meer dekking (' + oud.toFixed(1) + '%)' };
     }
     return { mag: true, reden: '' };
+  }
+  // Alleen bij aanvullen (HA actief): versturen als er niets staat of als onze versie duidelijk nauwkeuriger is.
+  function nauwkeuriger(bestaand, r) {
+    if (!bestaand) return true;
+    var lab = leesLabel(bestaand.note), t = r.bron === 'BE' ? 'be' : 'cache';
+    if (!lab) return true;
+    if (lab.type === 'cache' && t === 'be') return true;
+    if (lab.type === 'be' && t === 'be') { var o = Number(lab.kwal); if (!isFinite(o)) o = 0; return 100 * (r.kwal || 0) > o + 1; }
+    if (lab.type === 'cache' && t === 'cache') { var o2 = Number(lab.dekking); if (!isFinite(o2)) o2 = 0; return 100 * r.dekking > o2 + 1; }
+    return false;
   }
   // Home Assistant actief? Jongste 'actief' in een label met bron=ha, max. 40 min oud.
   var HA_GRENS = 40 * 60000, haStatus = { at: 0, actief: null, dk: null, gecontroleerd: 0 };
@@ -755,7 +778,7 @@ function bembPage() {
       (w.geschattePrijs ? '. ' + w.geschattePrijs + ' kwartieren met daggemiddelde prijs' : '') + '. All-in' + (c.saldeert ? ', EB op teruglevering t/m 2026' : ', zonder EB op teruglevering') +
       '. Besparing = ontladen naar huis minus evenredige laadkosten; handel = ontladen naar net minus evenredige laadkosten' +
       (r.bron === 'BE' && c.afrr ? ' plus aFRR-vergoeding' : '') + '. ' + etaTekst(r.eta || ETA) + '.';
-    var label = maakLabel('browser', r.bron === 'BE' ? 'be' : 'cache', r.dekking);
+    var label = maakLabel('browser', r.bron === 'BE' ? 'be' : 'cache', r.dekking, null, r.kwal);
     note = note.slice(0, 480 - label.length - 1) + ' ' + label;
     return { date: r.dk, batteryResult: e2(w.totaal), batterySavings: e2(w.besparing),
       chargedToday: k3(w.geladen), dischargedToday: k3(w.ontladen), invalid: !!invalid, note: note, intervals: intervallen(r.kw) };
@@ -809,12 +832,14 @@ function bembPage() {
   }
   async function verstuurDag(id, r, c, rapport, bestaand) {
     if (bestaand !== undefined) {
-      var regel = magOverschrijven(bestaand, r.bron === 'BE' ? 'be' : 'cache', r.dekking);
+      var regel = magOverschrijven(bestaand, r.bron === 'BE' ? 'be' : 'cache', r.dekking, r.kwal);
       if (!regel.mag) { rapport.push(r.dk + ': niet vervangen — ' + regel.reden + (((leesLabel(bestaand && bestaand.note) || {}).bron === 'ha') ? ' (Home Assistant)' : '') + '.'); return false; }
     }
     var p = dagPayload(r, c), hash = JSON.stringify(p), sk = k(id, (c.proef ? 'proef:' : 'sent:') + r.dk), st = await lees(sk);
     if (st && st.bron === 'BE' && r.bron !== 'BE') { rapport.push(r.dk + ': definitieve versie al verstuurd; cache niet teruggezet.'); return false; }
-    if (st && st.hash === hash) return false;
+    // Hash alleen vertrouwen als de huidige versie op Mijnbatterij van de browser zelf is.
+    var vanAnder = bestaand && ((leesLabel(bestaand.note) || {}).bron || '') !== 'browser';
+    if (st && st.hash === hash && !vanAnder) return false;
     var body = c.proef ? Object.assign({ test: true }, p) : p;
     await mb('POST', '/api/results/daily', body);
     await schrijf(sk, { hash: hash, bron: r.bron, at: Date.now(), totaal: p.batteryResult, besparing: p.batterySavings, payload: body });
@@ -825,7 +850,9 @@ function bembPage() {
     var id = klant(), c = cfg(); if (!id) throw Error('Geen installatie bekend');
     if (!handmatig && (!c.auto || !heeftSleutel)) return;
     try { await controleerHA(handmatig); } catch (e) { noteer('HA-controle: ' + e.message); }
-    if (haNeemtOver(c)) { var m = 'Dagen: Home Assistant verstuurt (actief ' + klok(haStatus.at) + '); browser doet niets.'; noteer(m); laatsteDagronde = Date.now(); render(); return m; }
+    // Verstuurt Home Assistant, dan vult de browser alleen aan: dagen die er nog niet staan,
+    // of die hij nauwkeuriger heeft (bijv. van vóór de HA-installatie, met meer eigen metingen).
+    var aanvullen = haNeemtOver(c);
     return lock('bemb-dagen', async function () {
       var rapport = [], vandaagK = vandaag(), dagen = [];
       for (var i = DAG_VENSTER; i >= 1; i--) dagen.push(plusDagen(vandaagK, -i));
@@ -833,7 +860,7 @@ function bembPage() {
       try { var ba = await mb('GET', '/api/results/daily?from=' + dagen[0] + '&to=' + dagen[dagen.length - 1]), bj = JSON.parse(ba.text); bestaand = {};
         ((bj && bj.results) || []).forEach(function (x) { if (x && x.date) bestaand[String(x.date).slice(0, 10)] = x; }); }
       catch (e) { rapport.push('Mijnbatterij-records niet opgehaald (' + e.message + '); geen dagen verstuurd.'); return rapport.join('\n'); }
-      var maandJ = {};
+      var maandJ = {}, overgelaten = 0;
       for (var ym of Array.from(new Set(dagen.map(function (d) { return d.slice(0, 7); })))) {
         try { maandJ[ym] = await maandBron(id, ym, handmatig ? 60000 : 2 * 3600000); }
         catch (e) { if (e.pauze) { rapport.push(e.message); break; } rapport.push(ym + ': ' + e.message); }
@@ -842,10 +869,12 @@ function bembPage() {
         try {
           var r = await bepaalDag(id, dk, maandJ[dk.slice(0, 7)], c, handmatig, rapport);
           if (!r) continue;
+          if (aanvullen && !nauwkeuriger(bestaand[dk] || null, r)) { overgelaten++; continue; }
           await verstuurDag(id, r, c, rapport, bestaand[dk] || null);
         } catch (e) { rapport.push(dk + ': ' + e.message); if (e.pauze) break; }
       }
       laatsteDagronde = Date.now();
+      if (aanvullen) rapport.push('Dagen: Home Assistant verstuurt (actief ' + klok(haStatus.at) + ')' + (overgelaten ? '; ' + overgelaten + ' dagen aan HA gelaten' : '') + '.');
       if (!rapport.length) rapport.push('Dagen: niets gewijzigd.');
       rapport.forEach(noteer); render();
       return rapport.join('\n');

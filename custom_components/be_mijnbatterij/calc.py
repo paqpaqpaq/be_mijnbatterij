@@ -457,7 +457,7 @@ def parse_definitief(j: dict, rij: dict | None, dk: str) -> dict[int, dict]:
 
 
 def verdeel_definitief(bron: dict[int, dict], cache: dict[int, dict] | None, e: dict | None = None) -> dict:
-    uit, uit_cache, geschat, aangevuld, ontbrekend = {}, 0, 0, 0, 0
+    uit, uit_cache, geschat, geschat_actief, aangevuld, ontbrekend = {}, 0, 0, 0, 0, 0
     cache = cache or {}
     for q, v in bron.items():
         c = cache.get(q)
@@ -502,8 +502,21 @@ def verdeel_definitief(bron: dict[int, dict], cache: dict[int, dict] | None, e: 
             n["ontHuis"] = min(ont, max(rest, 0.0))
             n["ontNet"] = ont - n["ontHuis"]
             geschat += 1
+            if v["laden"] > 0 or v["ontladen"] > 0:
+                geschat_actief += 1
         uit[q] = n
-    return {"kw": uit, "uitCache": uit_cache, "geschat": geschat, "aangevuld": aangevuld, "ontbrekend": ontbrekend}
+    return {"kw": uit, "n": len(bron), "uitCache": uit_cache, "geschat": geschat, "geschatActief": geschat_actief,
+            "aangevuld": aangevuld, "ontbrekend": ontbrekend}
+
+
+def kwaliteit(d: dict, w: dict) -> float:
+    """Nauwkeurigheid van een definitieve dag (0–1): aandeel kwartieren met verdeling uit eigen
+    metingen en een echte prijs. Bepaalt welke verzender een BE-dag mag vervangen."""
+    n = d.get("n") or 0
+    if not n:
+        return 0.0
+    slecht = d["geschatActief"] + d["ontbrekend"] + (w.get("geschattePrijs") or 0) + (w.get("zonderPrijs") or 0)
+    return max(0.0, min(1.0, (n - slecht) / n))
 
 
 # ── Payloads en afstemmingslabel ────────────────────────────────────────
@@ -513,8 +526,11 @@ def verdeel_definitief(bron: dict[int, dict], cache: dict[int, dict] | None, e: 
 LABEL_RE = re.compile(r"\[BEMB ([^\]]*)\]")
 
 
-def maak_label(versie: str, bron: str, type_: str, dekking: float, actief: str | None = None) -> str:
+def maak_label(versie: str, bron: str, type_: str, dekking: float, actief: str | None = None,
+               kwal: float | None = None) -> str:
     deel = f"v={versie} bron={bron} type={type_} dekking={to_fixed(100 * dekking, 1)}"
+    if type_ == "be" and getal(kwal):
+        deel += f" kwal={to_fixed(100 * kwal, 1)}"
     if actief:
         deel += f" actief={actief}"
     return f"[BEMB {deel}]"
@@ -554,7 +570,7 @@ def dag_payload(r: dict, saldeert: bool, afrr: bool, versie: str, bron_label: st
             + ". All-in" + (", EB op teruglevering t/m 2026" if saldeert else ", zonder EB op teruglevering")
             + ". Besparing = ontladen naar huis minus evenredige laadkosten; handel = ontladen naar net minus evenredige laadkosten"
             + (" plus aFRR-vergoeding" if r["bron"] == "BE" and afrr else "") + ". " + eta_tekst(r.get("eta") or ETA_STANDAARD) + ".")
-    label = maak_label(versie, bron_label, "be" if r["bron"] == "BE" else "cache", r["dekking"], actief)
+    label = maak_label(versie, bron_label, "be" if r["bron"] == "BE" else "cache", r["dekking"], actief, r.get("kwal"))
     note = note[: 480 - len(label) - 1] + " " + label
     return {"date": r["dk"], "batteryResult": e2(w["totaal"]), "batterySavings": e2(w["besparing"]),
             "chargedToday": k3(w["geladen"]), "dischargedToday": k3(w["ontladen"]), "invalid": bool(invalid),
@@ -569,11 +585,13 @@ def payload_hash(p: dict) -> str:
     return json.dumps(q, sort_keys=True, separators=(",", ":"))
 
 
-def mag_overschrijven(bestaand: dict | None, nieuw_type: str, nieuw_dekking: float) -> tuple[bool, str]:
+def mag_overschrijven(bestaand: dict | None, nieuw_type: str, nieuw_dekking: float,
+                      nieuw_kwal: float | None = None) -> tuple[bool, str]:
     """Afstemmingsregel voor een dagrecord op Mijnbatterij (gelijk in plugin en HA).
 
     - BE-definitief wordt nooit vervangen door een voorlopige (cache) versie.
     - Voorlopig vervangt voorlopig alleen bij minstens gelijke dekking.
+    - Definitief vervangt definitief alleen bij minstens gelijke nauwkeurigheid (kwal).
     - Records zonder label (oude versies) mogen worden vervangen.
     """
     lab = lees_label((bestaand or {}).get("note"))
@@ -581,6 +599,15 @@ def mag_overschrijven(bestaand: dict | None, nieuw_type: str, nieuw_dekking: flo
         return True, ""
     if lab.get("type") == "be" and nieuw_type != "be":
         return False, "definitieve versie staat er al"
+    if lab.get("type") == "be" and nieuw_type == "be":
+        # Labels zonder kwal (vóór 1.2.2) tellen als 0: die mogen altijd worden verbeterd.
+        try:
+            oud_k = float(lab.get("kwal", "0"))
+        except ValueError:
+            oud_k = 0.0
+        nk = 100 * (nieuw_kwal or 0)
+        if oud_k > nk + 0.05:
+            return False, f"bestaande definitieve versie is nauwkeuriger ({oud_k:.1f}% tegen {nk:.1f}%)"
     if lab.get("type") == "cache" and nieuw_type == "cache":
         try:
             oud = float(lab.get("dekking", "0"))

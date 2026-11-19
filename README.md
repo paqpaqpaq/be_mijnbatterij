@@ -50,14 +50,15 @@ Bij het instellen kies je of je eerst wilt proberen (**proefstand**, standaard u
 Beide zetten achter de notitie van elk dagrecord een label:
 
 ```
-[BEMB v=1.1.0 bron=ha|browser type=be|cache dekking=99.8 actief=2026-11-19T09:30:00+01:00]
+[BEMB v=1.2.2 bron=ha|browser type=be|cache dekking=99.8 kwal=97.9 actief=2026-11-19T09:30:00+01:00]
 ```
 
 - **Heartbeat:** Home Assistant zet elke 15 minuten `actief=<tijd>` in één dagrecord.
-- **Plugin past zich aan:** ziet de plugin een heartbeat van hooguit 40 minuten oud, dan verstuurt hij geen live- en dagresultaten meer. De pagina toont dan "Home Assistant verstuurt". Is de heartbeat ouder, dan verstuurt de plugin weer zelf.
+- **Plugin past zich aan:** ziet de plugin een heartbeat van hooguit 40 minuten oud, dan verstuurt hij geen live meer en vult hij alleen nog dagen aan: dagen die er nog niet staan, of die hij duidelijk nauwkeuriger heeft (bijvoorbeeld van vóór de HA-installatie). De pagina toont dan "Home Assistant verstuurt". Is de heartbeat ouder, dan verstuurt de plugin weer alles zelf.
 - **Wie wint per dag:**
   - *definitief* (BE) gaat altijd voor *voorlopig*;
   - *voorlopig* vervangt *voorlopig* alleen bij minstens gelijke meetdekking;
+  - *definitief* vervangt *definitief* alleen bij minstens gelijke nauwkeurigheid (`kwal`): het aandeel kwartieren waarvan de verdeling over huis en net uit eigen metingen komt en de prijs echt bekend is (niet het daggemiddelde). Zonder eigen metingen van een dag moet een verzender de BE-kwartieren schatten, en dat is minder nauwkeurig;
   - zo vult de bron met de meeste meetdata een dag in.
 - **Proefstand:** in proefstand stuurt Home Assistant geen heartbeat, dus neemt de plugin niets over.
 - **Plugin-override:** in de plugin kun je *Altijd zelf versturen* kiezen.
