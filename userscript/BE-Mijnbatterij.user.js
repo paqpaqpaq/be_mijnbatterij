@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BE Mijnbatterij
 // @namespace    paq.balansenergie
-// @version      1.1.0
+// @version      1.1.1
 // @description  Deelt accuresultaten van het Balans Energie-dashboard met mijnbatterij.nl, gesplitst in handel en besparing. Los van Balansenergie All-in; eigen pagina in het menu.
 // @homepageURL  https://github.com/paqpaqpaq/be_mijnbatterij
 // @updateURL    https://raw.githubusercontent.com/paqpaqpaq/be_mijnbatterij/main/userscript/BE-Mijnbatterij.user.js
@@ -73,7 +73,7 @@
       if (!fn) { answer({ ok: false, error: 'GM_xmlhttpRequest ontbreekt' }); return; }
       fn({
         method: method, url: API + v.path, timeout: 25000,
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.1.0' },
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.1.1' },
         data: v.body ? JSON.stringify(v.body) : undefined,
         onload: function (r) {
           var ok = r.status >= 200 && r.status < 300, text = String(r.responseText || '');
@@ -92,12 +92,13 @@ function bembPage() {
   if (window.__bembLoaded) return;
   window.__bembLoaded = true;
 
-  var VERSIE = '1.1.0', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
+  var VERSIE = '1.1.1', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
   var BTW = 1.21, OPSLAG = 0.02;
   // Energiebelasting excl. btw, schijf 1. Saldering eindigt op 1-1-2027.
   var EB_EX = { 2025: 0.10154, 2026: 0.09161, 2027: 0.08802 };
   var RAUW_DAGEN = 10, PRIJS_DAGEN = 16, DAG_VENSTER = 10;
-  var MIN_DEKKING_VOORLOPIG = 0.5;
+  var MIN_DEKKING_VOORLOPIG = 0.99; // voorlopige dag alleen bij (vrijwel) volledige metingen
+  var coulombCache = { at: 0, id: '', rows: [] }, ARCHIEF_GAT = 300000;
   var MAX_KAAL = 1.5, MIN_KWH = 0.05; // grenzen voor een bruikbare kale kwartierprijs (€/kWh)
 
   /* ── Tijd ── */
@@ -248,7 +249,7 @@ function bembPage() {
       onbekend: function (s) { return w.some(function (x) { return s >= x[0] && s < x[1]; }); } };
   }
 
-  if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven }; return; }
+  if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven }; return; }
 
   /* ── Installatie en instellingen ── */
   function geldig(id) { return !!id && /^[A-Za-z0-9_-]+$/.test(id) && !/^(?:account|results|current-history|current-prices|undefined|null)$/i.test(id); }
@@ -444,26 +445,66 @@ function bembPage() {
     var rows = ((await lees(k(id, 'rauw:' + dk))) || {}).rows || [];
     var vorige = ((await lees(k(id, 'rauw:' + plusDagen(dk, -1)))) || {}).rows || [];
     if (vorige.length) rows = [vorige[vorige.length - 1]].concat(rows);
-    var kw = naarKwartieren(rows), uit = {};
-    Object.keys(kw).forEach(function (q) { if (+q >= g.start && +q < g.eind) uit[q] = kw[q]; });
+    var kw = naarKwartieren(rows), arch = naarKwartieren(await allinMetingen(id, dk)), uit = {};
+    // Per kwartier de bron met de meeste accudekking; bij gelijke dekking de eigen meting.
+    Object.keys(kw).concat(Object.keys(arch)).forEach(function (q) {
+      if (+q < g.start || +q >= g.eind || uit[q]) return;
+      var a = kw[q], b = arch[q];
+      uit[q] = !a ? b : !b ? a : ((b.accuSec || 0) > (a.accuSec || 0) + 1 ? b : a);
+    });
+    return uit;
+  }
+  /* Metingen uit Balansenergie All-in (ALLEEN LEZEN): accuvermogen + SOC uit de
+   * coulombtelling (be-own-energy-soc-v1, 30 dagen) en netvermogen uit het
+   * bronarchief (balansenergie-bronnen-v1, per dag). Zelfde tijdstempels uit
+   * dezelfde BE-historie; samengevoegd tot één tijdlijn. Gaten tot 5 min (de
+   * pollinterval van All-in) worden overbrugd, langere niet. */
+  async function allinMetingen(id, dk) {
+    var g = grenzen(dk); if (!g) return [];
+    if (coulombCache.id !== id || Date.now() - coulombCache.at > 60000) {
+      var c = await leesAllinDb('be-own-energy-soc-v1', 'installations', id);
+      coulombCache = { at: Date.now(), id: id, rows: ((c && c.rows) || []).filter(function (r) { return Array.isArray(r) && getal(r[0]) && getal(r[2]); }) };
+    }
+    var van = g.start - 600000, tot = g.eind + 600000;
+    var C = coulombCache.rows.filter(function (r) { return r[0] >= van && r[0] < tot; });
+    if (!C.length) return [];
+    var N = [];
+    for (var d of [plusDagen(dk, -1), dk, plusDagen(dk, 1)]) {
+      var n = await leesAllinDb('balansenergie-bronnen-v1', 'dagen', id + ':' + d);
+      ((n && n.rows) || []).forEach(function (r) { if (r && getal(r.t) && getal(r.po) && r.t >= van && r.t < tot) N.push(r); });
+    }
+    if (!N.length) return [];
+    N.sort(function (a, b) { return a.t - b.t; });
+    var T = Array.from(new Set(C.map(function (r) { return r[0]; }).concat(N.map(function (r) { return r.t; })))).sort(function (a, b) { return a - b; });
+    var ci = 0, ni = 0, uit = [];
+    T.forEach(function (t) {
+      while (ci + 1 < C.length && C[ci + 1][0] <= t) ci++;
+      while (ni + 1 < N.length && N[ni + 1].t <= t) ni++;
+      var c = C[ci], n = N[ni];
+      if (!c || c[0] > t || t - c[0] > ARCHIEF_GAT || !n || n.t > t || t - n.t > ARCHIEF_GAT) return;
+      var o = { t: t, po: n.po, bo: c[2], r: ARCHIEF_GAT / 1.5 };
+      if (getal(c[1])) o.s = c[1];
+      uit.push(o);
+    });
     return uit;
   }
   // Prijsarchief van Balansenergie All-in (6.8.x), ALLEEN LEZEN. Bestaat de
   // database niet, dan wordt het aanmaken direct afgebroken: All-in moet zijn
   // eigen database met eigen store kunnen aanmaken.
   var allinCache = { at: 0, id: '', rows: {} };
-  function leesAllinArchief(id) {
+  function leesAllinArchief(id) { return leesAllinDb('balansenergie-bronnen-v1', 'dagen', id + ':prijzen'); }
+  function leesAllinDb(naam, store, sleutelWaarde) {
     return new Promise(function (resolve) {
       var klaar = false, r;
       function uit(v) { if (!klaar) { klaar = true; resolve(v); } }
-      try { r = indexedDB.open('balansenergie-bronnen-v1'); } catch (e) { uit(null); return; }
+      try { r = indexedDB.open(naam); } catch (e) { uit(null); return; }
       r.onupgradeneeded = function () { try { r.transaction.abort(); } catch (e) {} };
       r.onerror = function () { uit(null); }; r.onblocked = function () { uit(null); };
       r.onsuccess = function () {
         var d = r.result;
         try {
-          if (!d.objectStoreNames.contains('dagen')) { d.close(); uit(null); return; }
-          var q = d.transaction('dagen', 'readonly').objectStore('dagen').get(id + ':prijzen');
+          if (!d.objectStoreNames.contains(store)) { d.close(); uit(null); return; }
+          var q = d.transaction(store, 'readonly').objectStore(store).get(sleutelWaarde);
           q.onsuccess = function () { d.close(); uit(q.result || null); };
           q.onerror = function () { d.close(); uit(null); };
         } catch (e) { try { d.close(); } catch (x) {} uit(null); }
@@ -858,7 +899,7 @@ function bembPage() {
       '<section class="panel"><h2>Vandaag <small id="live-info" style="font-weight:400;font-size:12px"></small></h2><div class="tiles" id="tiles"></div></section>' +
       '<section class="panel"><h2>Afgelopen dagen</h2><div class="table-wrap"><table><thead><tr><th>Datum</th><th>Bron</th><th>Dekking</th><th>Handel</th><th>Besparing</th><th>Totaal</th><th>Geladen</th><th>Ontladen</th><th>Verstuurd</th><th>Op Mijnbatterij</th></tr></thead><tbody id="dagen"></tbody></table></div>' +
       '<div class="actions">' + knop('Vergelijk met Mijnbatterij', 'id="vergelijk"') + '<span class="notice" id="vergelijk-info" style="margin:0;align-self:center">Klik op een dag voor de exacte payload en wat Mijnbatterij opsloeg.</span></div><pre id="maand-mb" style="margin-top:8px"></pre>' +
-      '<p class="notice">Tot BE een dag als complete markeert (ca. 48 uur) komt de dag uit de eigen browsercache van de ruwe metingen (max. 26 uur terug op te halen). Daarna wordt hij met de BE-kwartierdata opnieuw berekend en overschreven.</p></section>' +
+      '<p class="notice">Tot BE een dag als complete markeert (ca. 48 uur) komt de dag uit de metingen in deze browser: de eigen cache plus, alleen-lezend, de coulombtelling en het netarchief van Balansenergie All-in. Een voorlopige dag gaat pas mee bij minstens 99% dekking. Daarna wordt hij met de BE-kwartierdata opnieuw berekend en overschreven.</p></section>' +
       '<section class="panel"><h2>Instellingen</h2>' +
       '<div class="row"><input id="key" type="password" autocomplete="off" placeholder="Mijnbatterij API-sleutel (profielpagina)">' + knop('Opslaan', 'id="key-save"') + knop('Controleren', 'id="key-test"') + knop('Wissen', 'id="key-wis"') + '</div>' +
       '<p class="notice" id="key-state"></p>' +

@@ -23,7 +23,7 @@ OPSLAG = 0.02
 EB_EX = {2025: 0.10154, 2026: 0.09161, 2027: 0.08802}
 MAX_KAAL = 1.5   # €/kWh: daarboven is een kale kwartierprijs onbruikbaar
 MIN_KWH = 0.05   # minimale netstroom voor een bruikbare effectieve prijs
-MIN_DEKKING_VOORLOPIG = 0.5
+MIN_DEKKING_VOORLOPIG = 0.99  # voorlopige dag alleen bij (vrijwel) volledige metingen
 FLOWS = ("ontHuis", "ontNet", "ladNet", "ladPV")
 
 
