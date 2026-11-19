@@ -368,28 +368,42 @@ def parse_definitief(j: dict, rij: dict | None, dk: str) -> dict[int, dict]:
                 raise BronFout("Ongeldig: " + x)
         bl = v["battery_charged_kwh"] if getal(v.get("battery_charged_kwh")) else 0.0
         bo = v["battery_discharged_kwh"] if getal(v.get("battery_discharged_kwh")) else 0.0
-        if not getal(v.get("battery_charged_kwh")) or not getal(v.get("battery_discharged_kwh")):
+        leeg = not getal(v.get("battery_charged_kwh")) or not getal(v.get("battery_discharged_kwh"))
+        if leeg:
             leeg_accu += 1
         laden += bl
         ontladen += bo
         pi, pu = v.get("effective_import_price_eur_per_kwh"), v.get("effective_export_price_eur_per_kwh")
-        out[q] = {"imp": v["grid_import_kwh"], "exp": v["grid_export_kwh"], "laden": bl, "ontladen": bo,
+        out[q] = {"imp": v["grid_import_kwh"], "exp": v["grid_export_kwh"], "laden": bl, "ontladen": bo, "leeg": leeg,
                   "pIn": pi if getal(pi) else None, "pUit": pu if getal(pu) else None}
     if len(out) != (eind - start) // Q:
         raise BronFout("Kwartieren dekken niet de hele dag")
     if rij and getal(rij.get("battery_charged_kwh")) and getal(rij.get("battery_discharged_kwh")) and (
             abs(laden - rij["battery_charged_kwh"]) > 0.15 or abs(ontladen - rij["battery_discharged_kwh"]) > 0.15):
         raise BronFout("Kwartieren sluiten niet aan op dagtotaal")
-    if leeg_accu > 4:
-        raise BronFout(f"{leeg_accu} kwartieren zonder accuwaarden")
     return out
 
 
 def verdeel_definitief(bron: dict[int, dict], cache: dict[int, dict] | None) -> dict:
-    uit, uit_cache, geschat = {}, 0, 0
+    uit, uit_cache, geschat, aangevuld, ontbrekend = {}, 0, 0, 0, 0
     cache = cache or {}
     for q, v in bron.items():
         c = cache.get(q)
+        # BE-kwartier zonder accuwaarden: aanvullen uit eigen metingen, anders als ongemeten tellen.
+        if v.get("leeg"):
+            m = {"imp": v["imp"], "exp": v["exp"], "accuSec": 0, "ladNet": 0.0, "ladPV": 0.0, "ontHuis": 0.0,
+                 "ontNet": 0.0, "geladen": 0.0, "ontladen": 0.0}
+            if c and c.get("accuSec", 0) >= 810:
+                for f in FLOWS:
+                    m[f] = c[f]
+                m["geladen"], m["ontladen"], m["accuSec"] = c["ladNet"] + c["ladPV"], c["ontHuis"] + c["ontNet"], 900
+                if getal(c.get("soc")):
+                    m["soc"] = c["soc"]
+                aangevuld += 1
+            else:
+                ontbrekend += 1
+            uit[q] = m
+            continue
         cl = (c["ladNet"] + c["ladPV"]) if c else 0
         co = (c["ontHuis"] + c["ontNet"]) if c else 0
         n = {"imp": v["imp"], "exp": v["exp"], "accuSec": 900, "geladen": v["laden"], "ontladen": v["ontladen"]}
@@ -412,7 +426,7 @@ def verdeel_definitief(bron: dict[int, dict], cache: dict[int, dict] | None) -> 
             n["ontNet"] = ont - n["ontHuis"]
             geschat += 1
         uit[q] = n
-    return {"kw": uit, "uitCache": uit_cache, "geschat": geschat}
+    return {"kw": uit, "uitCache": uit_cache, "geschat": geschat, "aangevuld": aangevuld, "ontbrekend": ontbrekend}
 
 
 # ── Payloads en afstemmingslabel ────────────────────────────────────────
@@ -458,7 +472,7 @@ def dag_payload(r: dict, saldeert: bool, afrr: bool, versie: str, bron_label: st
         kop = ("Voorlopig uit HA-metingen" if bron_label == "ha" else "Voorlopig uit browsercache") + f", dekking {to_fixed(100 * r['dekking'], 1)}%"
     else:
         invalid = w["zonderPrijs"] > 0 or (w.get("geschattePrijs") or 0) > 8
-        kop = "BE definitief"
+        kop = "BE definitief" + (f", {r['aangevuld']} kwartieren accuwaarden uit eigen metingen" if r.get("aangevuld") else "")
     note = (kop + (f". {w['geschattePrijs']} kwartieren met daggemiddelde prijs" if w.get("geschattePrijs") else "")
             + ". All-in" + (", EB op teruglevering t/m 2026" if saldeert else ", zonder EB op teruglevering")
             + ". Besparing = ontladen naar huis minus evenredige laadkosten; handel = ontladen naar net minus evenredige laadkosten"

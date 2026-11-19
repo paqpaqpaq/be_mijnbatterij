@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BE Mijnbatterij
 // @namespace    paq.balansenergie
-// @version      1.1.1
+// @version      1.1.2
 // @description  Deelt accuresultaten van het Balans Energie-dashboard met mijnbatterij.nl, gesplitst in handel en besparing. Los van Balansenergie All-in; eigen pagina in het menu.
 // @homepageURL  https://github.com/paqpaqpaq/be_mijnbatterij
 // @updateURL    https://raw.githubusercontent.com/paqpaqpaq/be_mijnbatterij/main/userscript/BE-Mijnbatterij.user.js
@@ -73,7 +73,7 @@
       if (!fn) { answer({ ok: false, error: 'GM_xmlhttpRequest ontbreekt' }); return; }
       fn({
         method: method, url: API + v.path, timeout: 25000,
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.1.1' },
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.1.2' },
         data: v.body ? JSON.stringify(v.body) : undefined,
         onload: function (r) {
           var ok = r.status >= 200 && r.status < 300, text = String(r.responseText || '');
@@ -92,7 +92,7 @@ function bembPage() {
   if (window.__bembLoaded) return;
   window.__bembLoaded = true;
 
-  var VERSIE = '1.1.1', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
+  var VERSIE = '1.1.2', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
   var BTW = 1.21, OPSLAG = 0.02;
   // Energiebelasting excl. btw, schijf 1. Saldering eindigt op 1-1-2027.
   var EB_EX = { 2025: 0.10154, 2026: 0.09161, 2027: 0.08802 };
@@ -213,9 +213,18 @@ function bembPage() {
   // Complete BE-kwartieren: bruto kWh van BE, verdeling uit de eigen cache
   // als die het kwartier goed dekt, anders uit de netto accubeweging.
   function verdeelDefinitief(bron, cache) {
-    var uit = {}, uitCache = 0, geschat = 0;
+    var uit = {}, uitCache = 0, geschat = 0, aangevuld = 0, ontbrekend = 0;
     Object.keys(bron).forEach(function (q) {
       var v = bron[q], c = cache && cache[q];
+      // BE-kwartier zonder accuwaarden: aanvullen uit eigen metingen, anders als ongemeten tellen.
+      if (v.leeg) {
+        var m = { imp: v.imp, exp: v.exp, accuSec: 0, ladNet: 0, ladPV: 0, ontHuis: 0, ontNet: 0, geladen: 0, ontladen: 0 };
+        if (c && c.accuSec >= 810) {
+          ['ladNet', 'ladPV', 'ontHuis', 'ontNet'].forEach(function (f) { m[f] = c[f]; });
+          m.geladen = c.ladNet + c.ladPV; m.ontladen = c.ontHuis + c.ontNet; m.accuSec = 900; m.soc = c.soc; aangevuld++;
+        } else ontbrekend++;
+        uit[q] = m; return;
+      }
       var cl = c ? c.ladNet + c.ladPV : 0, co = c ? c.ontHuis + c.ontNet : 0;
       var n = { imp: v.imp, exp: v.exp, accuSec: 900, geladen: v.laden, ontladen: v.ontladen, soc: c && c.soc };
       if (c && c.accuSec >= 810 && (cl > 0 || v.laden === 0) && (co > 0 || v.ontladen === 0)) {
@@ -229,7 +238,7 @@ function bembPage() {
       }
       uit[q] = n;
     });
-    return { kw: uit, uitCache: uitCache, geschat: geschat };
+    return { kw: uit, uitCache: uitCache, geschat: geschat, aangevuld: aangevuld, ontbrekend: ontbrekend };
   }
   function prijsKeuze(p, ctx, events, disc) {
     var state = ctx.authoritative ? (ctx.planned.has(p.start) ? 'planned' : ctx.onbekend(p.start) ? 'unavailable' : 'none')
@@ -568,16 +577,16 @@ function bembPage() {
       // dagtotaal hieronder bewaakt dat er niets wezenlijks verdwijnt.
       ['battery_charged_kwh', 'battery_discharged_kwh'].forEach(function (x) { if (v[x] != null && (!getal(v[x]) || v[x] < 0)) throw Error('Ongeldig: ' + x + ' om ' + klok(q)); });
       var bl = getal(v.battery_charged_kwh) ? v.battery_charged_kwh : 0, bo = getal(v.battery_discharged_kwh) ? v.battery_discharged_kwh : 0;
-      if (!getal(v.battery_charged_kwh) || !getal(v.battery_discharged_kwh)) leegAccu++;
+      var leeg = !getal(v.battery_charged_kwh) || !getal(v.battery_discharged_kwh);
+      if (leeg) leegAccu++;
       laden += bl; ontladen += bo;
-      out[q] = { imp: v.grid_import_kwh, exp: v.grid_export_kwh, laden: bl, ontladen: bo,
+      out[q] = { imp: v.grid_import_kwh, exp: v.grid_export_kwh, laden: bl, ontladen: bo, leeg: leeg,
         pIn: getal(v.effective_import_price_eur_per_kwh) ? v.effective_import_price_eur_per_kwh : null,
         pUit: getal(v.effective_export_price_eur_per_kwh) ? v.effective_export_price_eur_per_kwh : null };
     });
     if (Object.keys(out).length !== (g.eind - g.start) / Q) throw Error('Kwartieren dekken niet de hele dag');
     if (rij && getal(rij.battery_charged_kwh) && getal(rij.battery_discharged_kwh) &&
       (Math.abs(laden - rij.battery_charged_kwh) > 0.15 || Math.abs(ontladen - rij.battery_discharged_kwh) > 0.15)) throw Error('Kwartieren sluiten niet aan op dagtotaal');
-    if (leegAccu > 4) throw Error(leegAccu + ' kwartieren zonder accuwaarden');
     return out;
   }
   function afrrVan(rij) { if (!rij) return null; var a = rij.balance_energie_eur, b = rij.deal_customer_share_eur; return getal(a) || getal(b) ? (getal(a) ? a : 0) + (getal(b) ? b : 0) : null; }
@@ -615,9 +624,10 @@ function bembPage() {
     // Ontlaadt de accu naar huis, dan is de afname ~0 en BE's effectieve prijs
     // onbruikbaar. De marktprijs van dat kwartier is dan de juiste waardering.
     if (dk >= plusDagen(vandaag(), -1)) { try { await herstelPrijzenDag(id, dk, 6 * 3600000); } catch (e) { if (e.pauze) throw e; noteer('Prijzen ' + dk + ': ' + e.message); } }
+    if (d.ontbrekend > 4) throw Error(d.ontbrekend + ' kwartieren zonder accuwaarden, ook niet in eigen metingen');
     var kw = kiesPrijzen(d.kw, bron, await prijsIndex(id), rij), w = waardeer(kw, c, c.afrr ? afrrVan(rij) : null);
     var duur = (grenzen(dk).eind - grenzen(dk).start) / 1000;
-    return { dk: dk, bron: 'BE', kw: kw, w: w, dekking: 1, prijsDekking: Math.min(1, w.prijsSec / duur), uitCache: d.uitCache, geschat: d.geschat };
+    return { dk: dk, bron: 'BE', kw: kw, w: w, dekking: Math.min(1, w.accuSec / duur), prijsDekking: Math.min(1, w.prijsSec / duur), uitCache: d.uitCache, geschat: d.geschat, aangevuld: d.aangevuld };
   }
   var maandCache = {};
   async function maandBron(id, ym, maxLeeftijd) {
@@ -682,7 +692,7 @@ function bembPage() {
   function dagPayload(r, c) {
     // Meer dan 2 uur met daggemiddelde prijs: geen kwartierwaardering meer, dus als onzeker markeren.
     var w = r.w, invalid = r.bron === 'cache' ? (r.dekking < 0.99 || r.prijsDekking < 0.99 || w.zonderPrijs > 0) : (w.zonderPrijs > 0 || (w.geschattePrijs || 0) > 8);
-    var note = (r.bron === 'BE' ? 'BE definitief' : 'Voorlopig uit browsercache, dekking ' + (100 * r.dekking).toFixed(1) + '%') +
+    var note = (r.bron === 'BE' ? 'BE definitief' + (r.aangevuld ? ', ' + r.aangevuld + ' kwartieren accuwaarden uit eigen metingen' : '') : 'Voorlopig uit browsercache, dekking ' + (100 * r.dekking).toFixed(1) + '%') +
       (w.geschattePrijs ? '. ' + w.geschattePrijs + ' kwartieren met daggemiddelde prijs' : '') + '. All-in' + (c.saldeert ? ', EB op teruglevering t/m 2026' : ', zonder EB op teruglevering') +
       '. Besparing = ontladen naar huis minus evenredige laadkosten; handel = ontladen naar net minus evenredige laadkosten' +
       (r.bron === 'BE' && c.afrr ? ' plus aFRR-vergoeding' : '') + '.';

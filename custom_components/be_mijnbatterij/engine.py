@@ -216,11 +216,14 @@ class Engine:
     async def dag_definitief(self, dk: str, rij: dict, force: bool) -> dict:
         bron = await self.haal_definitief(dk, rij, force)
         d = calc.verdeel_definitief(bron, self.kw_dag(dk))
+        if d["ontbrekend"] > 4:
+            raise calc.BronFout(f"{d['ontbrekend']} kwartieren zonder accuwaarden, ook niet in eigen metingen")
         kw = calc.kies_prijzen(d["kw"], bron, self.prijs_index(), rij)
         w = calc.waardeer(kw, self.saldeert, calc.afrr_van(rij) if self.afrr else None)
         start, eind = calc.grenzen(dk)
-        return {"dk": dk, "bron": "BE", "kw": kw, "w": w, "dekking": 1.0,
-                "prijsDekking": min(1.0, w["prijsSec"] / ((eind - start) / 1000))}
+        duur = (eind - start) / 1000
+        return {"dk": dk, "bron": "BE", "kw": kw, "w": w, "dekking": min(1.0, w["accuSec"] / duur),
+                "prijsDekking": min(1.0, w["prijsSec"] / duur), "aangevuld": d["aangevuld"]}
 
     async def bepaal_dag(self, dk: str, maand_j: dict | None, force: bool, rapport: list[str]) -> dict | None:
         rij = next((r for r in (maand_j or {}).get("series", []) if isinstance(r, dict) and r.get("date") == dk), None)
