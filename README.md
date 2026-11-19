@@ -45,6 +45,10 @@ Bij het instellen kies je of je eerst wilt proberen (**proefstand**, standaard u
 - **All-in prijs:** kale BE-prijs × 1,21 ± € 0,02 opslag, plus energiebelasting op afname. Tot en met 2026 komt de EB ook terug op teruglevering (saldering).
 - **Prijs per kwartier:** de effectieve kwartierprijs van BE, als die betrouwbaar is (minstens 0,05 kWh netstroom en hooguit € 1,50/kWh kaal). Anders de vastgelegde marktprijs (onbalans, aFRR of day-ahead). Alleen als laatste redmiddel het daggemiddelde; een dag met meer dan 2 uur daggemiddelde gaat als `invalid` mee.
 
+## Prijzen
+
+Sinds 17-11-2026 geeft BE alleen nog voor een deel van de kwartieren een prijs. Ontbrekende onbalansprijzen vullen plugin en integratie aan met de publieke minuutprijzen van Tenergy, op dezelfde manier als Balansenergie All-in (per kwartier volgens de regeltoestand). BE gaat altijd voor. De plugin leest daarvoor de Tenergy-cache van All-in; de integratie haalt de pagina zelf elke minuut op.
+
 ## Samenwerking met de browserplugin
 
 Beide zetten achter de notitie van elk dagrecord een label:
@@ -60,6 +64,7 @@ Beide zetten achter de notitie van elk dagrecord een label:
   - *voorlopig* vervangt *voorlopig* alleen bij minstens gelijke meetdekking;
   - *definitief* vervangt *definitief* alleen bij minstens gelijke nauwkeurigheid (`kwal`): het aandeel kwartieren waarvan de verdeling over huis en net uit eigen metingen komt en de prijs echt bekend is (niet het daggemiddelde). Zonder eigen metingen van een dag moet een verzender de BE-kwartieren schatten, en dat is minder nauwkeurig;
   - zo vult de bron met de meeste meetdata een dag in.
+- **Eén live-verzender:** kan Home Assistant zijn heartbeat nergens kwijt (de plugin heeft alle recente dagen nauwkeuriger, bijvoorbeeld vlak na de installatie), dan stuurt hij ook geen live; de status toont dan "browserplugin verstuurt". Zodra HA zelf volledige dagen heeft, neemt hij het over.
 - **Proefstand:** in proefstand stuurt Home Assistant geen heartbeat, dus neemt de plugin niets over.
 - **Plugin-override:** in de plugin kun je *Altijd zelf versturen* kiezen.
 

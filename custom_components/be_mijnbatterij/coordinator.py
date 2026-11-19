@@ -9,11 +9,12 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from . import calc
-from .api import BEAuthError, BEClient, BEError, BERateLimited, MBAuthError, MBClient, MBError
+from .api import BEAuthError, BEClient, BEError, BERateLimited, MBAuthError, MBClient, MBError, TenergyClient
 from .const import DOMAIN, LIVE_S, POLL_S, STANDAARD_OPTIES, VERSIE
 from .engine import DAGRONDE_S, HEARTBEAT_S, Engine
 
@@ -27,6 +28,7 @@ class BEMBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.store: Store[dict] = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}")
         self.engine: Engine | None = None
         self._be, self._mb = be, mb
+        self._tenergy = TenergyClient(async_get_clientsession(hass))
         self._laatste_live = 0.0
         self.fout: str = ""
 
@@ -35,7 +37,7 @@ class BEMBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_laad(self) -> None:
         state = await self.store.async_load() or {}
-        self.engine = Engine(self._be, self._mb, state, self.opties(), VERSIE)
+        self.engine = Engine(self._be, self._mb, state, self.opties(), VERSIE, tenergy=self._tenergy)
 
     def bewaar(self) -> None:
         self.store.async_delay_save(lambda: self.engine.s if self.engine else {}, 30)
@@ -56,7 +58,7 @@ class BEMBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         e.noteer(f"Live: {err}")
                 if nu - e.laatste_dagronde >= DAGRONDE_S:
                     await e.dag_ronde(False)
-                if not e.proef and nu - e.laatste_heartbeat >= HEARTBEAT_S:
+                if not e.proef and nu - max(e.laatste_heartbeat, e.hb_poging) >= HEARTBEAT_S:
                     try:
                         await e.heartbeat()
                     except (MBError, BEError) as err:
@@ -96,7 +98,8 @@ class BEMBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "dekking": (v or {}).get("dekking"), "zonder_prijs": w.get("zonderPrijs"),
             "soc": (e.s.get("laatste") or {}).get("s") if e else None,
             "laatste_live": e.laatste_live["at"] / 1000 if e and e.laatste_live else None,
-            "status": self.fout or ("proefstand" if e and e.proef else "actief" if e and e.versturen else "alleen meten"),
+            "status": self.fout or ("proefstand" if e and e.proef else "browserplugin verstuurt" if e and e.versturen and e.hb_mislukt
+                                   else "actief" if e and e.versturen else "alleen meten"),
             "log": (e.log[:15] if e else []), "dagen": dagen, "kwartieren": len(top),
             "rendement": e.eta if e else None,
         }

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BE Mijnbatterij
 // @namespace    paq.balansenergie
-// @version      1.2.2
+// @version      1.2.3
 // @description  Deelt accuresultaten van het Balans Energie-dashboard met mijnbatterij.nl, gesplitst in handel en besparing. Los van Balansenergie All-in; eigen pagina in het menu.
 // @homepageURL  https://github.com/paqpaqpaq/be_mijnbatterij
 // @updateURL    https://raw.githubusercontent.com/paqpaqpaq/be_mijnbatterij/main/userscript/BE-Mijnbatterij.user.js
@@ -77,7 +77,7 @@
         poging++;
         fn({
           method: method, url: API + v.path, timeout: 25000,
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.2.2' },
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': 'Bearer ' + key, 'User-Agent': 'BE-Mijnbatterij/1.2.3' },
           data: v.body ? JSON.stringify(v.body) : undefined,
           onload: function (r) {
             var ok = r.status >= 200 && r.status < 300, text = String(r.responseText || '');
@@ -103,7 +103,10 @@ function bembPage() {
   if (window.__bembLoaded) return;
   window.__bembLoaded = true;
 
-  var VERSIE = '1.2.2', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
+  var VERSIE = '1.2.3', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
+  // Marge (procentpunt): twee verzenders met vrijwel volledige data mogen elkaar vervangen;
+  // aanvullen naast HA gebeurt pas bij +1 pp, zodat ze niet pingpongen.
+  var TOLERANTIE = 0.5;
   var BTW = 1.21, OPSLAG = 0.02;
   // Energiebelasting excl. btw, schijf 1. Saldering eindigt op 1-1-2027.
   var EB_EX = { 2025: 0.10154, 2026: 0.09161, 2027: 0.08802 };
@@ -316,7 +319,7 @@ function bembPage() {
       onbekend: function (s) { return w.some(function (x) { return s >= x[0] && s < x[1]; }); } };
   }
 
-  if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger }; return; }
+  if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger, vulOnbalans: vulOnbalans, tenergyAanvullen: tenergyAanvullen, prijsKeuze: prijsKeuze }; return; }
 
   /* ── Installatie en instellingen ── */
   function geldig(id) { return !!id && /^[A-Za-z0-9_-]+$/.test(id) && !/^(?:account|results|current-history|current-prices|undefined|null)$/i.test(id); }
@@ -494,14 +497,46 @@ function bembPage() {
     noteer('Prijzen ' + dk + ': ' + (voor - na) + ' kwartieren hersteld uit BE' + (na ? ', ' + na + ' nog zonder prijs (BE leverde ' + ((j && j.prices) || []).length + ' rijen)' : '') + '.');
     return na;
   }
+  // Sinds 17-11-2026 geeft BE alleen nog prijzen van kwartieren waarin de accu iets deed.
+  // Balansenergie All-in vult onbalansprijzen aan via Tenergy (localStorage, zelfde site):
+  // die lezen we alleen. Rangorde: BE > Tenergy.
+  function tenergyCache() {
+    try { var o = JSON.parse(localStorage.getItem('be_onbalans_tenergy_v1') || '{}'); return o && typeof o === 'object' && !Array.isArray(o) ? o : {}; }
+    catch (e) { return {}; }
+  }
+  function vulOnbalans(values, t) {
+    var v = Object.assign({}, values || {});
+    if (t) {
+      if (!getal(v.onbalans_import) && getal(t.ki)) v.onbalans_import = t.ki;
+      if (!getal(v.onbalans_export) && getal(t.ke)) v.onbalans_export = t.ke;
+    }
+    return v;
+  }
+  function tenergyAanvullen(arch, ten, nu, van) {
+    var n = 0;
+    Object.keys(ten || {}).forEach(function (k) {
+      var q = +k, t = ten[k];
+      if (!(q >= van) || q > nu || q % Q || !t) return;
+      var a = arch[q];
+      if (!a) { arch[q] = { mi: 'onbalans_import', me: 'onbalans_export', ki: getal(t.ki) ? t.ki : null, ke: getal(t.ke) ? t.ke : null, v: !t.klaar || q + Q > nu, t: nu }; n++; return; }
+      var g = false;
+      if (a.mi === 'onbalans_import' && !getal(a.ki) && getal(t.ki)) { a.ki = t.ki; g = true; }
+      if (a.me === 'onbalans_export' && !getal(a.ke) && getal(t.ke)) { a.ke = t.ke; g = true; }
+      if (g) n++;
+    });
+    return n;
+  }
   async function verwerkPrijzen(id, j) {
     if (!j || !Array.isArray(j.prices)) return;
+    var ten = tenergyCache();
     var ctx = planning(j), events = new Set(j.afrrEventIsps || []), disc = {}, nu = Date.now();
     (j.afrrDiscovery || []).forEach(function (d) { if (d && getal(d.start) && Array.isArray(d.directions)) disc[d.start] = d.directions; });
     var arch = ((await lees(k(id, 'prijzen'))) || {}).rows || {};
     j.prices.forEach(function (p) {
       if (!p || !getal(p.start) || p.start % Q || p.carried) return;
+      p = Object.assign({}, p, { values: vulOnbalans(p.values, ten[p.start]) });
       var keus = prijsKeuze(p, ctx, events, disc), oud = arch[p.start] || {};
+      if (keus.ki === null && keus.ke === null && arch[p.start]) return; // BE gaf niets meer: vastgelegde prijs houden
       var tijdelijk = !!p.temporaryTariffs || (p.start <= nu && nu < p.start + Q);
       arch[p.start] = {
         mi: keus.mi, me: keus.me,
@@ -510,6 +545,7 @@ function bembPage() {
         v: !!p.provisional || tijdelijk, t: nu
       };
     });
+    tenergyAanvullen(arch, ten, nu, nu - 2 * 86400000);
     var grens = nu - PRIJS_DAGEN * 86400000;
     Object.keys(arch).forEach(function (s) { if (+s < grens) delete arch[s]; });
     await schrijf(k(id, 'prijzen'), { rows: arch });
@@ -738,11 +774,11 @@ function bembPage() {
     if (lab.type === 'be' && type === 'be') {
       // Labels zonder kwal (vóór 1.2.2) tellen als 0: die mogen altijd worden verbeterd.
       var oudK = Number(lab.kwal); if (!isFinite(oudK)) oudK = 0;
-      if (oudK > 100 * (kwal || 0) + 0.05) return { mag: false, reden: 'bestaande definitieve versie is nauwkeuriger (' + oudK.toFixed(1) + '% tegen ' + (100 * (kwal || 0)).toFixed(1) + '%)' };
+      if (oudK > 100 * (kwal || 0) + TOLERANTIE) return { mag: false, reden: 'bestaande definitieve versie is nauwkeuriger (' + oudK.toFixed(1) + '% tegen ' + (100 * (kwal || 0)).toFixed(1) + '%)' };
     }
     if (lab.type === 'cache' && type === 'cache') {
       var oud = Number(lab.dekking); if (!isFinite(oud)) oud = 0;
-      if (oud > 100 * dekking + 0.05) return { mag: false, reden: 'bestaande versie heeft meer dekking (' + oud.toFixed(1) + '%)' };
+      if (oud > 100 * dekking + TOLERANTIE) return { mag: false, reden: 'bestaande versie heeft meer dekking (' + oud.toFixed(1) + '%)' };
     }
     return { mag: true, reden: '' };
   }

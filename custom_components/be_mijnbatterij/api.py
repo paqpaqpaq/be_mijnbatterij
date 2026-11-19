@@ -175,3 +175,23 @@ class MBClient:
         j = await self._req("GET", f"/api/results/daily?from={van}&to={tot}")
         lijst = j if isinstance(j, list) else (j or {}).get("results") or []
         return {str(r.get("date", ""))[:10]: r for r in lijst if isinstance(r, dict) and r.get("date")}
+
+
+class TenergyClient:
+    """Publieke Tenergy-pagina met onbalansprijzen per minuut (anoniem)."""
+
+    def __init__(self, session: aiohttp.ClientSession) -> None:
+        self._s = session
+
+    async def pagina(self) -> str:
+        from .calc import TENERGY_URL
+        try:
+            async with self._s.get(TENERGY_URL, timeout=aiohttp.ClientTimeout(total=25),
+                                   headers={"User-Agent": "BE-Mijnbatterij-HA"}) as r:
+                if r.status != 200:
+                    raise BEError(f"Tenergy HTTP {r.status}")
+                return await r.text()
+        except BEError:
+            raise
+        except Exception as err:  # noqa: BLE001 — een externe bron mag de integratie nooit stilleggen
+            raise BEError(f"Tenergy niet bereikbaar ({type(err).__name__})") from err

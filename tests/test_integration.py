@@ -8,7 +8,7 @@ from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
 
-from custom_components.be_mijnbatterij import api
+from custom_components.be_mijnbatterij import api, calc
 from custom_components.be_mijnbatterij.const import DOMAIN
 
 from . import fake_servers as fs
@@ -25,6 +25,7 @@ async def server(socket_enabled, monkeypatch):
     echte = aiohttp.CookieJar
     monkeypatch.setattr(aiohttp, "CookieJar", lambda **kw: echte(unsafe=True, **kw))
     api.BE_BASE = api.MB_BASE = f"http://127.0.0.1:{srv.port}"
+    monkeypatch.setattr(calc, "TENERGY_URL", f"http://127.0.0.1:{srv.port}/tenergy")
     yield srv
     await srv.close()
 
@@ -51,7 +52,10 @@ async def test_volledig(hass: HomeAssistant, server) -> None:
     print("\n" + "\n".join(f"  {k} = {v.state}" for k, v in sorted(states.items())))
     reg = er.async_get(hass)
     eid = lambda dom, key: reg.async_get_entity_id(dom, DOMAIN, f"ABC123_{key}")
-    assert float(hass.states.get(eid("sensor", "dekking")).state) > 99
+    dek = hass.states.get(eid("sensor", "dekking"))
+    assert float(dek.state) > 99
+    # BE gaf alleen prijzen bij accu-activiteit; Tenergy vult de rest aan (hooguit het lopende kwartier mist).
+    assert dek.attributes["kwartieren_zonder_prijs"] <= 1, dek.attributes
     assert hass.states.get(eid("sensor", "status")).state == "proefstand"
     # proefstand: alles met test=true, niets opgeslagen
     assert fs.mb_log and all(b.get("test") for _, b in fs.mb_log)

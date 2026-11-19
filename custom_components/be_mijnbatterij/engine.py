@@ -17,7 +17,7 @@ import time
 from typing import Any, Awaitable, Callable
 
 from . import calc
-from .api import BEClient, BEError, BERateLimited, MBClient, MBError
+from .api import TenergyClient, BEClient, BEError, BERateLimited, MBClient, MBError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,13 +36,16 @@ def _nu_ms() -> int:
 
 class Engine:
     def __init__(self, be: BEClient, mb: MBClient, state: dict, opties: dict, versie: str,
-                 now_ms: Callable[[], int] = _nu_ms, slaap: Callable[[float], Awaitable[None]] = asyncio.sleep) -> None:
+                 now_ms: Callable[[], int] = _nu_ms, slaap: Callable[[float], Awaitable[None]] = asyncio.sleep,
+                 tenergy: TenergyClient | None = None) -> None:
         self.be, self.mb, self.versie = be, mb, versie
+        self.tenergy = tenergy
         self.opties = opties
         self.now_ms = now_ms
         self.slaap = slaap
         self.s = state
-        for key, leeg in (("kw", {}), ("prijzen", {}), ("def", {}), ("sent", {}), ("maand", {}), ("hersteld", {})):
+        for key, leeg in (("kw", {}), ("prijzen", {}), ("def", {}), ("sent", {}), ("maand", {}), ("hersteld", {}),
+                          ("tenergy", {}), ("tenergy_act", {})):
             self.s.setdefault(key, leeg)
         self.s.setdefault("eta_som", calc.kalibratie_leeg())
         self.log: list[str] = []
@@ -53,6 +56,12 @@ class Engine:
         self._prijs_tik = 0
         self._lock = asyncio.Lock()
         self.vandaag: dict | None = None
+        self._tenergy_at = 0.0
+        self.tenergy_fout = ""
+        # Heartbeat kon niet worden geplaatst: de browserplugin heeft betere dagen en verstuurt
+        # dan ook live; Home Assistant stuurt dan geen live om elkaar niet te overschrijven.
+        self.hb_mislukt = False
+        self.hb_poging = 0.0
 
     # ── hulpjes ──────────────────────────────────────────────────────────
     def noteer(self, tekst: str) -> None:
@@ -136,11 +145,13 @@ class Engine:
         for dk in [d for d in self.s["kw"] if d < grens]:
             del self.s["kw"][dk]
 
+        await self._tenergy(nu)
         self._prijs_tik += 1
         if self._prijs_tik % 2 == 1:
             try:
                 arch = self.prijs_index()
-                calc.verwerk_prijzen(arch, await self.be.current_prices(), nu)
+                calc.verwerk_prijzen(arch, await self.be.current_prices(), nu, self.s["tenergy"])
+                calc.tenergy_aanvullen(arch, self.s["tenergy"], nu, nu - 2 * 86_400_000)
                 self._bewaar_prijzen(arch)
             except BERateLimited:
                 raise
@@ -152,6 +163,25 @@ class Engine:
         for q in [q for q in self.s["prijzen"] if int(q) < pgrens]:
             del self.s["prijzen"][q]
         self.vandaag = self.dag_uit_metingen(calc.vandaag(nu), nu)
+
+    async def _tenergy(self, nu: int) -> None:
+        """Onbalansprijzen van Tenergy ophalen (elke minuut) en ontbrekende kwartieren aanvullen."""
+        if not self.tenergy or time.time() - self._tenergy_at < 55:
+            return
+        self._tenergy_at = time.time()
+        try:
+            n = calc.tenergy_verwerk(await self.tenergy.pagina(), nu, self.s["tenergy"], self.s["tenergy_act"])
+        except (BEError, ValueError) as err:
+            if str(err) != self.tenergy_fout:
+                self.noteer(f"Onbalansprijzen (Tenergy): {err}")
+            self.tenergy_fout = str(err)
+            return
+        if self.tenergy_fout:
+            self.noteer(f"Onbalansprijzen (Tenergy): weer bereikbaar ({n} kwartieren)")
+        self.tenergy_fout = ""
+        arch = self.prijs_index()
+        if calc.tenergy_aanvullen(arch, self.s["tenergy"], nu, nu - 2 * 86_400_000):
+            self._bewaar_prijzen(arch)
 
     def _bewaar_prijzen(self, arch: dict[int, dict]) -> None:
         self.s["prijzen"] = {str(k): v for k, v in arch.items()}
@@ -176,7 +206,7 @@ class Engine:
             self.noteer(f"Prijzen {dk}: {err}")
             return
         arch = self.prijs_index()
-        n = calc.verwerk_prijzen(arch, j, nu)
+        n = calc.verwerk_prijzen(arch, j, nu, self.s["tenergy"])
         self._bewaar_prijzen(arch)
         self.s["hersteld"][dk] = nu / 1000
         na = calc.prijs_gaten(self.prijs_index(), start, tot)
@@ -253,6 +283,8 @@ class Engine:
     async def live(self) -> dict | None:
         m = self.s.get("laatste")
         nu = self.now_ms()
+        if self.hb_mislukt and not self.proef:
+            raise MBError("de browserplugin verstuurt; Home Assistant vond geen dag voor zijn heartbeat")
         if not m or not calc.getal(m.get("bo")) or nu - m["t"] > 300_000:
             raise MBError("Geen actuele accumeting (jonger dan 5 min); live niet verstuurd")
         r = self.dag_uit_metingen(calc.dag_van(m["t"]), int(m["t"]))
@@ -348,10 +380,14 @@ class Engine:
                 if not mag:
                     continue
                 await self._verstuur_dag(r, bestaand.get(dk), [], actief=calc.iso_ams(nu))
+                self.hb_mislukt = False
                 self.laatste_heartbeat = time.time()
                 self.s["heartbeat_at"] = self.laatste_heartbeat
                 return dk
-            self.noteer("Heartbeat: geen dag gevonden om het actief-label op te zetten.")
+            if not self.hb_mislukt:
+                self.noteer("Heartbeat: de browserplugin heeft alle recente dagen nauwkeuriger; die verstuurt nu ook live.")
+            self.hb_mislukt = True
+            self.hb_poging = time.time()
             return None
 
     async def historie(self, van_ym: str, stop: Callable[[], bool] = lambda: False) -> list[str]:

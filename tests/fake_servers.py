@@ -44,8 +44,23 @@ async def prices(req):
     if "start" in req.query:
         be_log.append("prices-range"); return web.Response(status=400, text="bad")
     start, eind = calc.grenzen(GISTER)[0], calc.grenzen(DK)[1]
-    return web.json_response({"prices": [{"start": q, "end": q + 900000, "values": {"onbalans_import": 0.1 + (q // 900000 % 4) * 0.05, "onbalans_export": 0.08 + (q // 900000 % 4) * 0.05}} for q in range(start, eind, 900000)],
+    # Zoals BE sinds 17-11-2026: nog maar voor een klein deel van de kwartieren een prijs.
+    def waarden(q):
+        h = (q // 3600000) % 24
+        if h < 2:
+            return {"onbalans_import": 0.1 + (q // 900000 % 4) * 0.05, "onbalans_export": 0.08 + (q // 900000 % 4) * 0.05}
+        return {}
+    return web.json_response({"prices": [{"start": q, "end": q + 900000, "provisional": True, "values": waarden(q)} for q in range(start, min(eind, NU), 900000)],
                               "dayAheadPlans": [], "dayAheadUnavailableWindows": []})
+async def tenergy(req):
+    """Nep-Tenergy: ~30 uur minuutwaarden in de grafiekdata, zonder activatietabel."""
+    import json
+    nu = int(time.time() * 1000)
+    t0 = ((nu - 30 * 3600000) // 60000) * 60000
+    take = [{"Key": f"/Date({t})/", "Value": 150.0 + (t // 900000 % 3) * 10} for t in range(t0, nu, 60000)]
+    feed = [{"Key": f"/Date({t})/", "Value": 120.0 + (t // 900000 % 3) * 10} for t in range(t0, nu, 60000)]
+    data = {"ChartSeries": [{"Id": "PRICES_TAKE", "Data": take}, {"Id": "PRICES_FEED", "Data": feed}]}
+    return web.Response(text=f"<script>data = {json.dumps(data)}; serialChart.updateChart(data, 1);</script>", content_type="text/html")
 async def results(req):
     ingelogd(req); be_log.append("results-" + req.query["interval"])
     per = req.query["period"]
@@ -82,6 +97,6 @@ def maak_app():
     app = web.Application()
     app.add_routes([web.get("/accounts/login/", login_get), web.post("/accounts/login/", login_post), web.get("/customer/", customer),
                     web.get("/customer/current-history/api/", history), web.get("/customer/current-prices/api/", prices),
-                    web.get("/customer/ABC123/results-v2-api/", results),
+                    web.get("/customer/ABC123/results-v2-api/", results), web.get("/tenergy", tenergy),
                     web.get("/api/me", mb_me), web.post("/api/live", mb_live), web.post("/api/results/daily", mb_daily_post), web.get("/api/results/daily", mb_daily_get)])
     return app

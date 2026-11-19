@@ -10,7 +10,8 @@ from __future__ import annotations
 import json
 import math
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
+from html.parser import HTMLParser
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -267,7 +268,160 @@ def prijs_keuze(p: dict, ctx: dict, events: set, disc: dict) -> dict:
     return {"mi": mi, "me": me, "ki": ki, "ke": ke}
 
 
-def verwerk_prijzen(arch: dict[int, dict], j: dict | None, now_ms: int) -> int:
+# ── Onbalansprijzen via Tenergy ─────────────────────────────────────────
+# Sinds 17-11-2026 levert BE (current-prices) alleen nog prijzen van kwartieren waarin
+# de accu iets deed. Net als Balansenergie All-in vullen we onbalans_import/-export aan
+# uit de publieke Tenergy-pagina: minuutwaarden "Afnemen"/"Invoeden" (€/MWh), per
+# kwartier volgens de regeltoestand uit de activatietabel. Rangorde: BE > Tenergy.
+TENERGY_URL = "https://services.tenergy.nl/public.aspx/actualimbalanceprices"
+MINUUT = 60_000
+TENERGY_MIN_DEKKING = 10
+_TENERGY_DATA = re.compile(r"data\s*=\s*(\{[\s\S]*?\})\s*;\s*serialChart\.updateChart")
+
+
+def _tenergy_reeks(data: dict, ident: str) -> dict[int, float]:
+    s = next((x for x in (data.get("ChartSeries") or []) if isinstance(x, dict) and x.get("Id") == ident), None)
+    if not s or not isinstance(s.get("Data"), list):
+        raise ValueError(f"Tenergy-reeks {ident} ontbreekt")
+    uit: dict[int, float] = {}
+    for p in s["Data"]:
+        m = re.search(r"-?\d+", str((p or {}).get("Key")))
+        try:
+            v = float((p or {}).get("Value"))
+        except (TypeError, ValueError):
+            continue
+        if m and int(m.group(0)) % MINUUT == 0 and math.isfinite(v):
+            uit[int(m.group(0))] = v
+    return uit
+
+
+class _TabelLezer(HTMLParser):
+    """Rijen van <table class="imbalanceprices"> als lijsten celteksten."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rijen: list[list[str]] = []
+        self._diepte = 0
+        self._rij: list[str] | None = None
+        self._cel: list[str] | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "table":
+            if self._diepte or "imbalanceprices" in (dict(attrs).get("class") or "").split():
+                self._diepte += 1
+        elif self._diepte and tag == "tr":
+            self._rij = []
+        elif self._diepte and tag in ("td", "th") and self._rij is not None:
+            self._cel = []
+
+    def handle_endtag(self, tag):
+        if tag == "table" and self._diepte:
+            self._diepte -= 1
+        elif tag in ("td", "th") and self._cel is not None and self._rij is not None:
+            self._rij.append("".join(self._cel).strip())
+            self._cel = None
+        elif tag == "tr" and self._rij is not None:
+            self.rijen.append(self._rij)
+            self._rij = None
+
+    def handle_data(self, data):
+        if self._cel is not None:
+            self._cel.append(data)
+
+
+def _nl_getal(t: str) -> float | None:
+    try:
+        return float(str(t).strip().replace(".", "").replace(",", "."))
+    except ValueError:
+        return None
+
+
+def tenergy_activatie(html: str, nu: int, act: dict) -> dict:
+    """Minuutactivatie [op, af, nood op, nood af] (MW) uit de tabel; tabeltijd is NL-tijd."""
+    lezer = _TabelLezer()
+    lezer.feed(html)
+    dag = dag_van(nu)
+    for c in lezer.rijen:
+        if len(c) < 9 or not re.fullmatch(r"\d{1,2}:\d{2}", c[2]):
+            continue
+        vals = [_nl_getal(x) for x in c[3:7]]
+        if any(v is None for v in vals):
+            continue
+        uur, minuut = (int(x) for x in c[2].split(":"))
+        t = int(datetime.combine(date.fromisoformat(dag), dtime(uur, minuut), TZ).timestamp() * 1000)
+        if t > nu + MINUUT:
+            t -= 86_400_000
+        act[str(t)] = vals
+    grens = nu - 2 * 86_400_000
+    for k in [k for k in act if int(k) < grens]:
+        del act[k]
+    return act
+
+
+def tenergy_kwartier(q: int, afnemen: dict, invoeden: dict, act: dict, nu: int) -> dict | None:
+    minuten = [t for t in range(q, min(q + Q, nu + 1), MINUUT) if t in afnemen and t in invoeden]
+    if not minuten:
+        return None
+    laatste = minuten[-1]
+    res = {"ki": afnemen[laatste] / 1000, "ke": invoeden[laatste] / 1000, "minuut": laatste, "rs": None}
+    met = [t for t in minuten if str(t) in act]
+    if len(met) < TENERGY_MIN_DEKKING:
+        return res
+    op = [t for t in met if act[str(t)][0] > 0 or act[str(t)][2] > 0]
+    af = [t for t in met if act[str(t)][1] > 0 or act[str(t)][3] > 0]
+    if op and af:
+        res.update(rs=2, ki=max(afnemen[t] for t in minuten) / 1000, ke=min(invoeden[t] for t in minuten) / 1000)
+    elif af:
+        v = min([afnemen[t] for t in af] + [invoeden[t] for t in af]) / 1000
+        res.update(rs=-1, ki=v, ke=v)
+    elif op:
+        v = max([afnemen[t] for t in op] + [invoeden[t] for t in op]) / 1000
+        res.update(rs=1, ki=v, ke=v)
+    else:
+        res["rs"] = 0
+    return res
+
+
+def tenergy_verwerk(html: str, nu: int, kwartieren: dict, act: dict, bewaar_ms: int = 3 * 86_400_000) -> int:
+    """Tenergy-pagina samenvoegen in kwartieren {str(q): {ki, ke, klaar, rs}}. Geeft aantal."""
+    m = _TENERGY_DATA.search(html or "")
+    if not m:
+        raise ValueError("Tenergy-pagina zonder grafiekdata")
+    data = json.loads(m.group(1))
+    afnemen, invoeden = _tenergy_reeks(data, "PRICES_TAKE"), _tenergy_reeks(data, "PRICES_FEED")
+    tenergy_activatie(html, nu, act)
+    aantal = 0
+    for q in sorted({t - t % Q for t in afnemen if t <= nu}):
+        r = tenergy_kwartier(q, afnemen, invoeden, act, nu)
+        if not r:
+            continue
+        klaar = q + Q <= nu and r["minuut"] >= q + Q - MINUUT
+        oud = kwartieren.get(str(q))
+        if oud and oud.get("klaar") and not klaar:
+            continue
+        if oud and oud.get("klaar") and oud.get("rs") is not None and r["rs"] is None:
+            continue
+        kwartieren[str(q)] = {"ki": r["ki"], "ke": r["ke"], "klaar": klaar, "rs": r["rs"]}
+        aantal += 1
+    if not aantal:
+        raise ValueError("Tenergy gaf geen bruikbare minuutwaarden")
+    for k in [k for k in kwartieren if int(k) < nu - bewaar_ms]:
+        del kwartieren[k]
+    return aantal
+
+
+def vul_onbalans(values: dict, t: dict | None) -> dict:
+    """BE-waarden aanvullen met Tenergy waar BE geen onbalansprijs gaf."""
+    v = dict(values or {})
+    if t:
+        if not getal(v.get("onbalans_import")) and getal(t.get("ki")):
+            v["onbalans_import"] = t["ki"]
+        if not getal(v.get("onbalans_export")) and getal(t.get("ke")):
+            v["onbalans_export"] = t["ke"]
+    return v
+
+
+def verwerk_prijzen(arch: dict[int, dict], j: dict | None, now_ms: int, tenergy: dict | None = None) -> int:
     """Voeg een current-prices-antwoord samen in het archief. Geeft aantal rijen."""
     if not j or not isinstance(j.get("prices"), list):
         return 0
@@ -279,7 +433,10 @@ def verwerk_prijzen(arch: dict[int, dict], j: dict | None, now_ms: int) -> int:
     for p in j["prices"]:
         if not isinstance(p, dict) or not getal(p.get("start")) or p["start"] % Q or p.get("carried"):
             continue
+        p = {**p, "values": vul_onbalans(p.get("values"), (tenergy or {}).get(str(int(p["start"]))))}
         keus, oud = prijs_keuze(p, ctx, events, disc), arch.get(int(p["start"])) or {}
+        if keus["ki"] is None and keus["ke"] is None and oud:
+            continue  # BE gaf voor dit kwartier niets meer: eerder vastgelegde prijs houden
         tijdelijk = bool(p.get("temporaryTariffs")) or (p["start"] <= now_ms < p["start"] + Q)
         arch[int(p["start"])] = {
             "mi": keus["mi"], "me": keus["me"],
@@ -288,6 +445,29 @@ def verwerk_prijzen(arch: dict[int, dict], j: dict | None, now_ms: int) -> int:
             "v": bool(p.get("provisional")) or tijdelijk, "t": now_ms,
         }
         n += 1
+    return n
+
+
+def tenergy_aanvullen(arch: dict[int, dict], tenergy: dict | None, now_ms: int, van_ms: int) -> int:
+    """Kwartieren zonder (volledige) prijs aanvullen met Tenergy-onbalans, ook als BE de rij
+    helemaal niet meer levert. Alleen onbalansvelden; aFRR/day-ahead blijven van BE."""
+    n = 0
+    for k, t in (tenergy or {}).items():
+        q = int(k)
+        if q < van_ms or q > now_ms or q % Q:
+            continue
+        a = arch.get(q)
+        if not a:
+            arch[q] = {"mi": "onbalans_import", "me": "onbalans_export", "ki": t.get("ki"), "ke": t.get("ke"),
+                       "v": not t.get("klaar") or q + Q > now_ms, "t": now_ms}
+            n += 1
+            continue
+        gewijzigd = False
+        if a.get("mi") == "onbalans_import" and not getal(a.get("ki")) and getal(t.get("ki")):
+            a["ki"] = t["ki"]; gewijzigd = True
+        if a.get("me") == "onbalans_export" and not getal(a.get("ke")) and getal(t.get("ke")):
+            a["ke"] = t["ke"]; gewijzigd = True
+        n += gewijzigd
     return n
 
 
@@ -585,6 +765,11 @@ def payload_hash(p: dict) -> str:
     return json.dumps(q, sort_keys=True, separators=(",", ":"))
 
 
+# Marge (procentpunt) bij het vergelijken van dekking/nauwkeurigheid: twee verzenders met
+# vrijwel volledige data mogen elkaar vervangen; de plugin vult pas aan bij +1 pp (geen pingpong).
+TOLERANTIE = 0.5
+
+
 def mag_overschrijven(bestaand: dict | None, nieuw_type: str, nieuw_dekking: float,
                       nieuw_kwal: float | None = None) -> tuple[bool, str]:
     """Afstemmingsregel voor een dagrecord op Mijnbatterij (gelijk in plugin en HA).
@@ -606,13 +791,13 @@ def mag_overschrijven(bestaand: dict | None, nieuw_type: str, nieuw_dekking: flo
         except ValueError:
             oud_k = 0.0
         nk = 100 * (nieuw_kwal or 0)
-        if oud_k > nk + 0.05:
+        if oud_k > nk + TOLERANTIE:
             return False, f"bestaande definitieve versie is nauwkeuriger ({oud_k:.1f}% tegen {nk:.1f}%)"
     if lab.get("type") == "cache" and nieuw_type == "cache":
         try:
             oud = float(lab.get("dekking", "0"))
         except ValueError:
             oud = 0.0
-        if oud > 100 * nieuw_dekking + 0.05:
+        if oud > 100 * nieuw_dekking + TOLERANTIE:
             return False, f"bestaande versie heeft meer dekking ({oud:.1f}%)"
     return True, ""
