@@ -169,7 +169,7 @@ function bembPage() {
   var MAX_KAAL = 1.5, MIN_KWH = 0.05; // grenzen voor een bruikbare effectieve kwartierprijs (kosten/kWh, €/kWh)
   // Settlementprijzen (BE market_breakdown, TenneT, vastgesteld archief) zijn echte marktprijzen en
   // kunnen ver boven € 1,50 liggen (15-06-2026 09:45: € 3,50/kWh). Alleen een ruime plausibiliteitsgrens.
-  var MAX_SETTLE = 20;
+  var MAX_SETTLE = 100; // €/kWh: ruim boven elk marktplafond, alleen tegen onzinwaarden
 
   /* ── Tijd ── */
   var fmtDag = new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' });
