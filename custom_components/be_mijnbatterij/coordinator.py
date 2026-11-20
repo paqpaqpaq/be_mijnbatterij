@@ -102,5 +102,5 @@ class BEMBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "status": self.fout or ("proefstand" if e and e.proef else "browserplugin verstuurt" if e and e.versturen and e.browser_verstuurt
                                    else "actief" if e and e.versturen else "alleen meten"),
             "log": (e.log[:15] if e else []), "dagen": dagen, "kwartieren": len(top),
-            "rendement": e.eta if e else None,
+            "rendement": e.eta if e else None, "rendement_gemeten": e.eta_gemeten if e else None,
         }

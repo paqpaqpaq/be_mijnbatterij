@@ -198,10 +198,9 @@ class TenergyClient:
 
 
 class TennetClient:
-    """Openbare TenneT-publicatie van de settlementprijzen (anoniem, alleen lezen).
+    """Openbare TenneT-tabel met settlementprijzen (anoniem, alleen lezen, zonder cookie).
 
-    Oracle APEX: eerst de pagina (sessie + beveiligde velden), dan de grafiekdata met dezelfde
-    sessiecookie. De cookie gaat expliciet mee, los van de cookiejar van de gedeelde sessie."""
+    Eén GET per dag: tabelpagina 90035 met de datum in de URL en alle kwartieren op één pagina."""
 
     def __init__(self, session: aiohttp.ClientSession) -> None:
         self._s = session
@@ -209,30 +208,28 @@ class TennetClient:
     async def dag(self, dk: str) -> dict[int, list]:
         from . import calc
         datum = f"{dk[8:10]}-{dk[5:7]}-{dk[0:4]}"
-        basis = calc.TENNET_URL
-        hdr = {"User-Agent": "BE-Mijnbatterij-HA"}
+        regio = calc.TENNET_REGIO
+        t: dict = {}
         try:
-            async with self._s.get(f"{basis}f?p=100:90030:::::P90030_PTU_DATE_LOC:{datum}&p_lang=en",
-                                   timeout=aiohttp.ClientTimeout(total=25), headers={**hdr, "Accept": "text/html"}) as r:
-                if r.status != 200:
-                    raise BEError(f"TenneT-pagina HTTP {r.status}")
-                html = await r.text()
-                cookies = "; ".join(f"{k}={m.value}" for k, m in r.cookies.items())
-            pg = calc.tennet_pagina(html)
-            post_hdr = {**hdr, "Accept": "application/json", "X-Requested-With": "XMLHttpRequest"}
-            if cookies:
-                post_hdr["Cookie"] = cookies
-            async with self._s.post(f"{basis}wwv_flow.ajax?p_context=aetherweb-2-0100/atr_06_chart/{pg['inst']}",
-                                    data=calc.tennet_post(datum, pg), headers=post_hdr,
-                                    timeout=aiohttp.ClientTimeout(total=25)) as r:
-                tekst = await r.text()
-            try:
-                j = json.loads(tekst)
-            except ValueError as err:
-                raise BEError(f"TenneT gaf geen grafiekdata (HTTP {r.status}"
-                              + (", sessie niet geaccepteerd" if "<html" in tekst.lower() else "") + ")") from err
-            return calc.tennet_rijen(j)
+            for _ in range(2):
+                async with self._s.get(calc.tennet_url(datum, regio), timeout=aiohttp.ClientTimeout(total=25),
+                                       headers={"User-Agent": "BE-Mijnbatterij-HA", "Accept": "text/html"}) as r:
+                    if r.status != 200:
+                        raise BEError(f"TenneT-pagina HTTP {r.status}")
+                    html = await r.text()
+                t = calc.tennet_tabel(html)
+                # Andere regio-id (pagina aangepast): staat in de bladerknop; één keer opnieuw.
+                if t.get("regio") and t["regio"] != regio and len(t["rijen"]) < 92:
+                    regio = t["regio"]
+                    continue
+                break
         except (BEError, calc.BronFout):
             raise
         except Exception as err:  # noqa: BLE001 — een externe bron mag de integratie nooit stilleggen
             raise BEError(f"TenneT niet bereikbaar ({type(err).__name__})") from err
+        if t.get("leeg"):
+            return {}
+        # Nooit de prijzen van een andere dag gebruiken: TenneT valt bij een onbekende datum terug op gisteren.
+        if t.get("datum") != datum:
+            raise BEError(f"TenneT gaf {t.get('datum') or 'geen datum'} in plaats van {datum}")
+        return t["rijen"]

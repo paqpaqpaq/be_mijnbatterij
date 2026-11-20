@@ -44,6 +44,7 @@ class Engine:
         self.be, self.mb, self.versie = be, mb, versie
         self.tenergy = tenergy
         self.tennet = tennet
+        self._tn_mem: dict[str, dict[int, dict]] = {}
         self.opties = opties
         self.now_ms = now_ms
         self.slaap = slaap
@@ -102,6 +103,11 @@ class Engine:
 
     @property
     def eta(self) -> dict:
+        """Vast rendement uit BE-data (gelijk aan de plugin); de eigen meting staat in eta_gemeten."""
+        return calc.ETA_VAST
+
+    @property
+    def eta_gemeten(self) -> dict:
         return calc.kalibratie_eta(self.s["eta_som"])
 
     def kw_dag(self, dk: str) -> dict[int, dict]:
@@ -235,20 +241,26 @@ class Engine:
         nu = self.now_ms()
         if not self.tennet or dk >= calc.vandaag(nu):
             return {}
+        if dk in self._tn_mem:  # complete dag (verandert niet meer), ook als hij uit de opslag is opgeruimd
+            return self._tn_mem[dk]
         st = self.s["tennet"].get(dk)
-        if st and st.get("v") == 1 and (st.get("compleet") or nu / 1000 - st["at"] < (6 if st.get("rows") else 1) * 3600):
+        if st and st.get("v") == 2 and (st.get("compleet") or nu / 1000 - st["at"] < (6 if st.get("rows") else 1) * 3600):
             return {int(q): v for q, v in (st.get("rows") or {}).items()}
         try:
             rijen = await self.tennet.dag(dk)
             rows, compleet = calc.tennet_kwartieren(dk, rijen)
         except (BEError, calc.BronFout) as err:
             self.noteer(f"TenneT-prijzen {dk}: {err}")
-            self.s["tennet"][dk] = {"v": 1, "at": nu / 1000, "fout": str(err)}
+            self.s["tennet"][dk] = {"v": 2, "at": nu / 1000, "fout": str(err)}
             return {}
         if not rows:
-            self.s["tennet"][dk] = {"v": 1, "at": nu / 1000, "fout": "nog niet gepubliceerd"}
+            self.s["tennet"][dk] = {"v": 2, "at": nu / 1000, "fout": "nog niet gepubliceerd"}
             return {}
-        self.s["tennet"][dk] = {"v": 1, "at": nu / 1000, "compleet": compleet, "rows": {str(q): v for q, v in rows.items()}}
+        self.s["tennet"][dk] = {"v": 2, "at": nu / 1000, "compleet": compleet, "rows": {str(q): v for q, v in rows.items()}}
+        if compleet:
+            self._tn_mem[dk] = rows
+            while len(self._tn_mem) > 70:  # ruim twee maanden historie in het geheugen
+                self._tn_mem.pop(next(iter(self._tn_mem)))
         # Opslag klein houden: alleen het venster van de dagelijkse ronde bewaren (historie haalt zelf opnieuw).
         grens = calc.plus_dagen(calc.vandaag(nu), -14)
         for oud in [d for d in self.s["tennet"] if d < grens]:
@@ -256,6 +268,14 @@ class Engine:
         if not compleet:
             self.noteer(f"TenneT-prijzen {dk}: nog niet alle kwartieren gepubliceerd.")
         return rows
+
+    async def tennet_status(self, dk: str) -> tuple[bool, str]:
+        """(compleet, reden) van de TenneT-prijzen van een afgelopen dag."""
+        await self.tennet_prijzen(dk)
+        if dk in self._tn_mem:
+            return True, ""
+        st = self.s["tennet"].get(dk) or {}
+        return False, st.get("fout") or ("nog niet alle kwartieren gepubliceerd" if st.get("rows") else "geen antwoord")
 
     async def prijzen_dag(self, dk: str) -> dict[int, dict]:
         return calc.met_tennet(self.prijs_index(), await self.tennet_prijzen(dk))
@@ -485,11 +505,38 @@ class Engine:
             except MBError as err:
                 rapport.append(f"{ym}: Mijnbatterij {err}")
                 continue
+            # Eerst controleren dat TenneT's settlementprijzen voor elke dag binnen zijn; anders zou met
+            # benaderingen gerekend worden. Ontbreekt een oudere dag, dan deze maand niets versturen.
+            tn_wacht: set[str] = set()
+            tn_mist: list[str] = []
+            for dk in dagen:
+                if stop():
+                    break
+                ok, reden = await self.tennet_status(dk)
+                if ok:
+                    continue
+                if dk >= calc.plus_dagen(vk, -2):
+                    tn_wacht.add(dk)
+                else:
+                    tn_mist.append(f"{dk} ({reden})")
+            if stop():
+                rapport.append("Gestopt.")
+                break
+            if tn_mist:
+                rapport.append(f"{ym}: NIET verstuurd — TenneT-prijzen ontbreken voor: " + ", ".join(tn_mist))
+                self.noteer(f"Historie {ym}: niet verstuurd, TenneT-prijzen ontbreken voor {len(tn_mist)} dag(en).")
+                if len(tn_mist) == len(dagen) - len(tn_wacht):
+                    rapport.append("TenneT niet bereikbaar — historie gestopt.")
+                    break
+                continue
             som = {"t": 0.0, "b": 0.0, "l": 0.0, "o": 0.0, "n": 0}
             alles = True
             for dk in dagen:
                 if stop():
                     break
+                if dk in tn_wacht:
+                    alles = False
+                    continue
                 rij = next((r for r in j["series"] if isinstance(r, dict) and r.get("date") == dk), None)
                 if not rij or rij.get("status") != "complete":
                     alles = False
