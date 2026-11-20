@@ -1047,6 +1047,20 @@ function bembPage() {
     if (navigator.locks && navigator.locks.request) return navigator.locks.request(naam, { ifAvailable: true }, function (l) { return l ? fn() : null; });
     return fn();
   }
+  // Wachten op een lock (bv. een lopende dagronde) in plaats van opgeven. Stopt bij 'Stoppen' of na maxMs.
+  // Geeft true als fn gedraaid heeft, anders 'stop' of 'timeout'.
+  async function lockWacht(naam, fn, maxMs, bijWachten) {
+    if (!(navigator.locks && navigator.locks.request)) { await fn(); return true; }
+    var direct = await navigator.locks.request(naam, { ifAvailable: true }, async function (l) { if (!l) return false; await fn(); return true; });
+    if (direct) return true;
+    if (bijWachten) bijWachten();
+    if (typeof AbortController !== 'function') return 'timeout';
+    var ac = new AbortController(), reden = 'timeout', t0 = Date.now();
+    var kijk = setInterval(function () { if (historieStop) { reden = 'stop'; ac.abort(); } else if (Date.now() - t0 > maxMs) ac.abort(); }, 500);
+    try { await navigator.locks.request(naam, { signal: ac.signal }, async function () { clearInterval(kijk); await fn(); }); return true; }
+    catch (e) { if (e && e.name === 'AbortError') return reden; throw e; }
+    finally { clearInterval(kijk); }
+  }
   async function verzamel() {
     var id = klant(); if (!id || document.hidden) return;
     return lock('bemb-verzamel', async function () {
@@ -1280,10 +1294,11 @@ function bembPage() {
     historieBezig = true; historieStop = false; BE_PAUZE = HISTORIE_PAUZE;
     var rapport = [], uitslag = [];
     histStroom('Start: ' + lijst.join(', ') + (c.proef ? ' (proefstand)' : '') + ' — ca. 4 s per dag.');
+    tekenMaanden(); // stopknop direct zichtbaar, ook tijdens wachten op de dagronde
     try {
-      var gestart = false;
-      await lock('bemb-dagen', async function () {
-        gestart = true;
+      var gewacht = false;
+      var gestart = await lockWacht('bemb-dagen', async function () {
+        if (gewacht) histStroom('Dagronde klaar — historie start.');
         var vk = vandaag();
         for (var mi = 0; mi < lijst.length; mi++) {
           if (historieStop) { histStroom('Gestopt door gebruiker.'); break; }
@@ -1295,8 +1310,9 @@ function bembPage() {
           if (res.st !== 'fout' || res.fout !== 'gestopt') histSelectie.delete(ym);
           uitslag.push(ym + ': ' + res.st); tekenMaanden();
         }
-      });
-      if (!gestart) throw Error('Er loopt al een dagronde; probeer het zo opnieuw.');
+      }, 10 * 60000, function () { gewacht = true; histStroom('Wacht tot de automatische dagronde klaar is (gebeurt vanzelf)…'); });
+      if (gestart === 'stop') { histStroom('Gestopt door gebruiker (tijdens wachten op de dagronde).'); uitslag.push('gestopt'); }
+      else if (gestart !== true) throw Error('De automatische dagronde liep na 10 minuten nog steeds; probeer het later opnieuw.');
     } finally {
       historieBezig = false; BE_PAUZE = 1250; histVoortgang = null; toonVoortgang();
       Object.keys(histStatus).forEach(function (ym) { if (histStatus[ym] && histStatus[ym].bezig) delete histStatus[ym].bezig; });
