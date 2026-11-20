@@ -48,57 +48,59 @@
     if (typeof GM !== 'undefined' && GM && GM.setValue) { await GM.setValue(KEY, v); return; }
     throw new Error('Geen userscript-opslag beschikbaar');
   }
-  /* TenneT-publicatie van de settlementprijzen (openbaar, zonder sleutel): dezelfde data als de
-   * grafiek op tennet.eu/nl-en/settlement-prices-graph. Oracle APEX: eerst de pagina (sessie +
-   * beveiligde velden), dan de grafiekdata met dezelfde sessiecookie. Alleen lezen. */
-  var TENNET = 'https://publications.tennet.eu/ords/';
+  /* TenneT-publicatie van de settlementprijzen (openbaar, zonder sleutel en zonder cookie): de tabelpagina
+   * achter tennet.eu/nl-en/settlement-prices-table (Oracle APEX, pagina 90035). Eén GET per dag, met de
+   * datum in de URL en alle kwartieren op één pagina. Alleen lezen. */
+  var TENNET = 'https://publications.tennet.eu/ords/', TENNET_REGIO = '93369768093509395';
   function gmReq(o) {
     return new Promise(function (res) {
       var fn = gmx(); if (!fn) { res({ fout: 'GM_xmlhttpRequest ontbreekt' }); return; }
-      fn(Object.assign({ timeout: 25000 }, o, {
-        onload: function (r) { res({ status: r.status, text: String(r.responseText || ''), headers: String(r.responseHeaders || '') }); },
+      fn(Object.assign({ timeout: 25000, anonymous: true }, o, {
+        onload: function (r) { res({ status: r.status, text: String(r.responseText || '') }); },
         onerror: function (r) { res({ fout: 'Netwerkfout richting TenneT' + (r && r.error ? ' (' + String(r.error).slice(0, 120) + ')' : '') }); },
         ontimeout: function () { res({ fout: 'Timeout richting TenneT' }); }
       }));
     });
   }
-  function htmlAttr(s) { return s.split('&#x2F;').join('/').split('&#x3D;').join('=').split('&quot;').join('"').split('&amp;').join('&'); }
+  function tennetUrl(datum, regio) {
+    return TENNET + 'f?p=100:90035:0:' + (regio ? 'pg_R_' + regio : '') + ':NO::P90035_PTU_DATE_LOC:' + datum +
+      (regio ? '&pg_min_row=1&pg_max_rows=200&pg_rows_fetched=200' : '') + '&p_lang=en';
+  }
+  // Tabel lezen: {datum, rijen: {ISP: [tekort, overschot, regeltoestand]}} (€/MWh), of null bij een onherkenbare pagina.
+  function tennetTabel(html) {
+    var d = new DOMParser().parseFromString(html, 'text/html'), dt = d.getElementById('P90035_PTU_DATE_LOC');
+    var kop = Array.prototype.map.call(d.querySelectorAll('table th'), function (t) { return t.textContent.trim().toLowerCase(); });
+    var iT = kop.findIndex(function (k) { return k.indexOf('shortage') === 0; }), iO = kop.findIndex(function (k) { return k.indexOf('surplus') === 0; }), iR = kop.findIndex(function (k) { return k.indexOf('regulation state') === 0; });
+    // Pagina zonder tabel (dag nog niet gepubliceerd): geen rijen. Echt onherkenbaar alleen als het niet eens deze pagina is.
+    if (iT < 0 && iO < 0 && !d.querySelector('table th') && /id="pFlowStepId"[^>]*value="90035"|value="90035"[^>]*id="pFlowStepId"/.test(html)) return { datum: null, rijen: {}, leeg: true };
+    if (!dt || iT < 0 || iO < 0) return null;
+    var getalT = function (x) { x = String(x || '').replace(/,/g, '').trim(); if (!/^-?\d*\.?\d+$/.test(x)) return null; var v = parseFloat(x); return isFinite(v) ? v : null; };
+    var rijen = {};
+    Array.prototype.forEach.call(d.querySelectorAll('table tbody tr'), function (tr) {
+      var c = Array.prototype.map.call(tr.cells, function (x) { return x.textContent.trim(); });
+      if (!/^\d+$/.test(c[0] || '')) return;
+      rijen[+c[0]] = [getalT(c[iT]), getalT(c[iO]), iR >= 0 ? getalT(c[iR]) : null];
+    });
+    var pag = /apex\.widget\.report\.paginate\('(\d+)'/.exec(html);
+    return { datum: String(dt.value || dt.getAttribute('value') || ''), rijen: rijen, regio: pag ? pag[1] : null };
+  }
   async function tennetDag(datum) {
     if (!/^\d{2}-\d{2}-\d{4}$/.test(datum)) return { ok: false, error: 'Ongeldige datum' };
-    var p = await gmReq({ method: 'GET', url: TENNET + 'f?p=100:90030:::::P90030_PTU_DATE_LOC:' + datum + '&p_lang=en', headers: { 'Accept': 'text/html' } });
-    if (p.fout) return { ok: false, error: p.fout };
-    if (p.status !== 200) return { ok: false, error: 'TenneT-pagina HTTP ' + p.status };
-    var h = p.text, bs = String.fromCharCode(92);
-    function veld(id) { var m = new RegExp('value="([^"]*)" id="' + id + '"').exec(h) || new RegExp('id="' + id + '"[^>]*value="([^"]*)"').exec(h); return m ? htmlAttr(m[1]) : null; }
-    var inst = veld('pInstance'), salt = veld('pSalt'), prot = veld('pPageItemsProtected');
-    var aj = /jetChart\.init\("R\d+"[\s\S]*?,"(UkVH[^"]+)"\)/.exec(h);
-    if (!inst || !salt || !prot || !aj || !/^\d+$/.test(inst)) return { ok: false, error: 'TenneT-pagina onherkenbaar (opbouw gewijzigd?)' };
-    var ajax = aj[1].split(bs + 'u002F').join('/');
-    // Sessiecookie meesturen: de browser doet dat meestal zelf; expliciet voor userscript-managers die dat niet doen.
-    var cookies = [];
-    p.headers.split(/\r?\n/).forEach(function (r) { var m = /^set-cookie:\s*([^=;\s]+=[^;]*)/i.exec(r); if (m) cookies.push(m[1]); });
-    var body = new URLSearchParams({ p_flow_id: '100', p_flow_step_id: '90030', p_instance: inst, p_debug: '', p_request: 'PLUGIN=' + ajax,
-      p_json: JSON.stringify({ pageItems: { itemsToSubmit: [{ n: 'P90030_PTU_DATE_LOC', v: datum }], protected: prot, rowVersion: '', formRegionChecksums: [] }, salt: salt }) }).toString();
-    var hd = { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' };
-    var o = { method: 'POST', url: TENNET + 'wwv_flow.ajax?p_context=aetherweb-2-0100/atr_06_chart/' + inst, headers: hd, data: body };
-    if (cookies.length) { hd.Cookie = cookies.join('; '); o.cookie = cookies.join('; '); }
-    var r = await gmReq(o);
-    if (r.fout) return { ok: false, error: r.fout };
-    var j; try { j = JSON.parse(r.text); } catch (e) { return { ok: false, error: 'TenneT gaf geen grafiekdata (HTTP ' + r.status + (/<html/i.test(r.text) ? ', sessie niet geaccepteerd' : '') + ')' }; }
-    if (j && /session/i.test(String(j.error || ''))) return { ok: false, geenCookie: true, error: 'TenneT accepteert de sessie niet: deze browser stuurt de sessiecookie niet mee (Safari/Userscripts). Gebruik Chrome of Home Assistant voor historie met TenneT-prijzen.' };
-    if (!j || !Array.isArray(j.series)) return { ok: false, error: 'TenneT-antwoord zonder reeksen' + (j && j.error ? ' (' + String(j.error).slice(0, 120) + ')' : '') };
-    // Per ISP-nummer: [tekort, overschot] in €/MWh.
-    var rijen = {};
-    j.series.forEach(function (s) {
-      var kol = s && s.name === 'Shortage' ? 0 : s && s.name === 'Surplus' ? 1 : -1;
-      if (kol < 0 || !Array.isArray(s.items)) return;
-      s.items.forEach(function (it) {
-        var m = it && /^\s*(\d{3})-\d{2}:\d{2}\s*$/.exec(String(it.name || ''));
-        if (!m || typeof it.value !== 'number' || !isFinite(it.value)) return;
-        (rijen[+m[1]] = rijen[+m[1]] || [null, null])[kol] = it.value;
-      });
-    });
-    return { ok: true, rijen: rijen };
+    var regio = TENNET_REGIO, t = null;
+    for (var poging = 0; poging < 2; poging++) {
+      var p = await gmReq({ method: 'GET', url: tennetUrl(datum, regio), headers: { 'Accept': 'text/html' } });
+      if (p.fout) return { ok: false, error: p.fout };
+      if (p.status !== 200) return { ok: false, error: 'TenneT-pagina HTTP ' + p.status };
+      t = tennetTabel(p.text);
+      if (!t) return { ok: false, error: 'TenneT-tabel onherkenbaar (opbouw gewijzigd?)' };
+      // Andere regio-id (pagina aangepast): de id staat in de bladerknop; dan één keer opnieuw.
+      if (t.regio && t.regio !== regio && Object.keys(t.rijen).length < 92) { regio = t.regio; continue; }
+      break;
+    }
+    if (t.leeg) return { ok: true, rijen: {} };
+    // Nooit de prijzen van een andere dag gebruiken: TenneT valt bij een onbekende datum terug op gisteren.
+    if (t.datum !== datum) return { ok: false, error: 'TenneT gaf ' + (t.datum || 'geen datum') + ' in plaats van ' + datum };
+    return { ok: true, rijen: t.rijen };
   }
   var GET_OK = /^\/api\/me$|^\/api\/results\/(?:daily|monthly)\?from=\d{4}-\d{2}(?:-\d{2})?&to=\d{4}-\d{2}(?:-\d{2})?$/;
   var POST_OK = /^\/api\/(?:live|results\/daily|results\/monthly)$/;
@@ -157,6 +159,7 @@ function bembPage() {
   if (window.__bembLoaded) return;
   window.__bembLoaded = true;
 
+  var TENNET_PAGINA = 'https://publications.tennet.eu/ords/';
   var VERSIE = '1.4.1', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
   // Marge (procentpunt): twee verzenders met vrijwel volledige data mogen elkaar vervangen;
   // aanvullen naast HA gebeurt pas bij +1 pp, zodat ze niet pingpongen.
@@ -770,13 +773,10 @@ function bembPage() {
   async function tennetPrijzen(dk, alleenCache) {
     var g = grenzen(dk); if (!g || dk >= vandaag()) return {};
     var sk = 'nl:tennet:' + dk, st = await lees(sk), nu = Date.now(), n = (g.eind - g.start) / Q;
-    if (st && st.v === 1 && (st.compleet || (alleenCache && st.rows) || nu - st.at < (st.rows ? 6 : 1) * 3600000)) return st.rows || {};
+    if (st && st.v === 2 && (st.compleet || (alleenCache && st.rows) || nu - st.at < (st.rows ? 6 : 1) * 3600000)) return st.rows || {};
     if (alleenCache) return (st && st.rows) || {};
-    // Deze browser kan TenneT niet bereiken (geen sessiecookie): een dag niet opnieuw proberen.
-    try { if (+localStorage.getItem('bemb_tennet_geen') > nu - 86400000) return {}; } catch (e) {}
     var a; try { a = await brug({ op: 'tennet', datum: dk.slice(8, 10) + '-' + dk.slice(5, 7) + '-' + dk.slice(0, 4) }); } catch (e) { a = { ok: false, error: e.message }; }
-    if (a && a.geenCookie) try { localStorage.setItem('bemb_tennet_geen', String(nu)); } catch (e) {}
-    if (!a || !a.ok) { noteer('TenneT-prijzen ' + dk + ': ' + ((a && a.error) || 'geen antwoord')); await schrijf(sk, { v: 1, at: nu, fout: (a && a.error) || 'geen antwoord' }); return {}; }
+    if (!a || !a.ok) { noteer('TenneT-prijzen ' + dk + ': ' + ((a && a.error) || 'geen antwoord')); await schrijf(sk, { v: 2, at: nu, fout: (a && a.error) || 'geen antwoord' }); return {}; }
     var rows = {}, c = 0;
     Object.keys(a.rijen || {}).forEach(function (i) {
       var isp = +i, r = a.rijen[i];
@@ -786,8 +786,8 @@ function bembPage() {
       rows[g.start + (isp - 1) * Q] = { ki: ki, ke: ke }; if (ki !== null && ke !== null) c++;
     });
     // Een dag zonder (volledige) publicatie later opnieuw proberen; een complete dag verandert niet meer.
-    if (!c) { await schrijf(sk, { v: 1, at: nu, fout: 'nog niet gepubliceerd' }); return {}; }
-    await schrijf(sk, { v: 1, at: nu, rows: rows, compleet: c === n });
+    if (!c) { await schrijf(sk, { v: 2, at: nu, fout: 'nog niet gepubliceerd' }); return {}; }
+    await schrijf(sk, { v: 2, at: nu, rows: rows, compleet: c === n });
     if (c < n) noteer('TenneT-prijzen ' + dk + ': ' + c + ' van ' + n + ' kwartieren gepubliceerd.');
     return rows;
   }
@@ -812,7 +812,6 @@ function bembPage() {
   // Status van de TenneT-prijzen van één afgelopen dag: compleet, of waarom niet.
   async function tennetStatus(dk) {
     await tennetPrijzen(dk);
-    try { if (+localStorage.getItem('bemb_tennet_geen') > Date.now() - 86400000) return { ok: false, browser: true, fout: 'deze browser stuurt de sessiecookie van TenneT niet mee (Safari/Userscripts) — gebruik Chrome of Home Assistant' }; } catch (e) {}
     var st = await lees('nl:tennet:' + dk);
     if (st && st.compleet) return { ok: true };
     return { ok: false, fout: (st && (st.fout || (st.rows ? 'nog niet alle kwartieren gepubliceerd' : ''))) || 'geen antwoord' };
@@ -1155,6 +1154,29 @@ function bembPage() {
   }
   var histStroomRegels = [];
   function eur(x) { return '€ ' + (Math.round(x * 100) / 100).toFixed(2).replace('.', ','); }
+  // Mini-tabel per maand: de TenneT-settlementprijzen waarmee gerekend wordt, met een link naar TenneT per dag.
+  async function toonTennet(ym, dagen) {
+    if (!shadow || !$('hist-tennet')) return;
+    var e3 = function (v) { return getal(v) ? v.toFixed(3).replace('.', ',') : '—'; };
+    var rijen = [];
+    for (var i = 0; i < dagen.length; i++) {
+      var st = await lees('nl:tennet:' + dagen[i]), rows = (st && st.rows) || {}, n = (grenzen(dagen[i]).eind - grenzen(dagen[i]).start) / Q;
+      var ki = [], ke = [];
+      Object.keys(rows).forEach(function (q) { if (getal(rows[q].ki)) ki.push(rows[q].ki); if (getal(rows[q].ke)) ke.push(rows[q].ke); });
+      var gem = function (a) { return a.length ? a.reduce(function (x, y) { return x + y; }, 0) / a.length : null; };
+      var dmy = dagen[i].slice(8, 10) + '-' + dagen[i].slice(5, 7) + '-' + dagen[i].slice(0, 4);
+      rijen.push('<tr><td>' + dagen[i] + '</td><td>' + Object.keys(rows).length + '/' + n + (st && st.compleet ? ' ✓' : '') + '</td><td>' + e3(gem(ki)) + '</td><td>' +
+        e3(ki.length ? Math.min.apply(null, ki) : null) + ' – ' + e3(ki.length ? Math.max.apply(null, ki) : null) + '</td><td>' + e3(gem(ke)) + '</td><td>' +
+        e3(ke.length ? Math.min.apply(null, ke) : null) + ' – ' + e3(ke.length ? Math.max.apply(null, ke) : null) + '</td><td><a href="' +
+        esc(TENNET_PAGINA + 'f?p=100:90035:::::P90035_PTU_DATE_LOC:' + dmy + '&p_lang=en') + '" target="_blank" rel="noopener">TenneT</a></td></tr>');
+    }
+    var oud = $('hist-tn-' + ym); if (oud) oud.remove();
+    var el = document.createElement('details'); el.id = 'hist-tn-' + ym; el.className = 'tn';
+    el.innerHTML = '<summary>' + esc(ym) + ' — TenneT-settlementprijzen waarmee gerekend wordt (' + dagen.length + ' dagen, €/kWh)</summary>' +
+      '<div class="table-wrap"><table><thead><tr><th>Datum</th><th>Kwartieren</th><th>Tekort gem.</th><th>Tekort min – max</th><th>Overschot gem.</th><th>Overschot min – max</th><th>Bron</th></tr></thead><tbody>' +
+      rijen.join('') + '</tbody></table></div>';
+    $('hist-tennet').hidden = false; $('hist-tennet').appendChild(el);
+  }
   async function verstuurMaand(id, ym, c, vk, rapport) {
     var res = { ym: ym, at: Date.now(), st: 'fout', dagen: 0, n: 0, verstuurd: 0, ongewijzigd: 0, geweigerd: 0, overgeslagen: 0, nietComplete: 0, totaal: 0, besparing: 0, maand: '', proef: !!c.proef, versie: VERSIE };
     var j; try { await wacht(BE_PAUZE); j = await maandBron(id, ym, 60000); }
@@ -1175,7 +1197,6 @@ function bembPage() {
       if (historieStop) break;
       var ts = await tennetStatus(dagen[ti]);
       if (ts.ok) continue;
-      if (ts.browser) { res.fout = 'TenneT niet bereikbaar: ' + ts.fout; res.tennet = 'browser'; histStroom(ym + '  NIET verstuurd — ' + res.fout + '.'); historieStop = true; return res; }
       // TenneT publiceert een dag pas na afloop; de laatste dagen kunnen nog ontbreken (volgt vanzelf).
       if (dagen[ti] >= plusDagen(vk, -2)) tnWacht[dagen[ti]] = ts.fout;
       else tnMist.push(dagen[ti] + ' (' + ts.fout + ')');
@@ -1183,11 +1204,14 @@ function bembPage() {
     if (historieStop) { res.fout = 'gestopt'; histStroom(ym + '  gestopt.'); return res; }
     if (tnMist.length) {
       res.fout = 'TenneT-prijzen ontbreken voor ' + tnMist.length + ' dag(en)'; res.tennet = 'mist';
+      // Geen enkele dag gelukt: TenneT is niet bereikbaar; dan ook de volgende maanden niet proberen.
+      if (tnMist.length === dagen.length - Object.keys(tnWacht).length) historieStop = true;
       histStroom(ym + '  NIET verstuurd — TenneT-prijzen ontbreken voor: ' + tnMist.join(', ') + '. Probeer het later opnieuw.');
       return res;
     }
     histStroom(ym + '  TenneT-prijzen compleet voor ' + (dagen.length - Object.keys(tnWacht).length) + '/' + dagen.length + ' dagen' +
       (Object.keys(tnWacht).length ? ' (' + Object.keys(tnWacht).join(', ') + ' nog niet gepubliceerd — volgt)' : '') + '.');
+    try { await toonTennet(ym, dagen.filter(function (d) { return !tnWacht[d]; })); } catch (e) {}
     var som = { t: 0, b: 0, l: 0, o: 0, n: 0 }, alles = true, gestopt = false;
     for (var di = 0; di < dagen.length; di++) {
       var dk = dagen[di];
@@ -1207,7 +1231,8 @@ function bembPage() {
         som.t += r.w.totaal; som.b += r.w.besparing; som.l += r.w.geladen; som.o += r.w.ontladen; som.n++;
         res[u.wat] = (res[u.wat] || 0) + 1;
         histStroom(dk + '  ' + eur(r.w.totaal) + '  (besparing ' + eur(r.w.besparing) + ', handel ' + eur(r.w.totaal - r.w.besparing) + ')  ' +
-          r.w.geladen.toFixed(1) + '↑ ' + r.w.ontladen.toFixed(1) + '↓ kWh  kwal ' + Math.round(100 * (r.kwal || 0)) + '%  → ' +
+          r.w.geladen.toFixed(1) + '↑ ' + r.w.ontladen.toFixed(1) + '↓ kWh  kwal ' + Math.round(100 * (r.kwal || 0)) + '%  TenneT-prijs in ' +
+          Object.keys(r.kw).filter(function (q) { return /TenneT/.test(r.kw[q].prijsBron || ''); }).length + ' kwartieren  → ' +
           (u.wat === 'verstuurd' ? (c.proef ? 'gevalideerd (proef)' : 'verstuurd') : u.wat === 'ongewijzigd' ? 'ongewijzigd' : 'niet vervangen: ' + u.reden));
       } catch (e) {
         alles = false; res.overgeslagen++; histStroom(dk + '  overgeslagen: ' + e.message);
@@ -1387,6 +1412,7 @@ function bembPage() {
       '.mnd .teken{position:absolute;right:9px;top:7px;font-weight:700}.st-ok .teken,.st-lopend .teken{color:var(--green)}.st-ok{border-color:var(--green)}.st-lopend{border:1px dashed var(--green)}.st-lopend .teken{opacity:.55}.st-deels .teken{color:#c98a12}.st-fout .teken{color:var(--red)}.st-leeg .teken,.st-proef .teken{color:var(--muted)}' +
       '.mnd.bezig{border-color:var(--purple);animation:bembpuls 1.2s ease-in-out infinite}@keyframes bembpuls{50%{background:var(--soft)}}' +
       '.balk{height:6px;border-radius:3px;background:var(--soft);overflow:hidden;margin-bottom:4px}.balk span{display:block;height:100%;width:0;background:var(--button);transition:width .3s}' +
+      '#hist-tennet{margin-top:10px}#hist-tennet details.tn{margin-top:6px;font-size:12px}#hist-tennet table{font-size:11px}#hist-tennet td,#hist-tennet th{padding:3px 6px;white-space:nowrap}' +
       '#hist-stroom{max-height:320px}@media(max-width:767px){.hist-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}' +
       'details summary{cursor:pointer;font-weight:600}.uitleg p{font-size:13px;margin-top:8px}.mobile-menu{display:none}' +
       '@media(max-width:767px){.page{padding:12px 10px 28px}.tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.tile strong{font-size:18px}.panel{padding:12px}button,input[type=month],input[type=password]{min-height:44px;font-size:16px}h1{font-size:20px}}' +
@@ -1405,6 +1431,7 @@ function bembPage() {
       '<div class="row" style="margin-top:12px">' + knop('Verstuur', 'id="hist-go" class="primary"') + knop('Stoppen', 'id="hist-stop" hidden') + '</div>' +
       '<div id="hist-voortgang" hidden style="margin-top:10px"><div class="balk"><span id="hist-balk"></span></div><small id="hist-voortgang-tekst"></small></div>' +
       '<pre id="hist-stroom" hidden aria-live="polite"></pre>' +
+      '<div id="hist-tennet" hidden></div>' +
       '<p class="notice">Vink maanden aan en verstuur ze: per dag zie je hieronder wat er gebeurt. ✓ met groene rand = gelukt (maandtotaal staat op Mijnbatterij), ✓ met stippelrand = bijgewerkt, maandtotaal volgt als de maand compleet is, ! = niet alle dagen bruikbaar (maandtotaal niet vervangen), ✕ = mislukt of gestopt, – = geen BE-dagen. De status blijft bewaard. Ca. 4 s per dag, om binnen de verzoeklimiet van BE te blijven; dagen die nauwkeuriger op Mijnbatterij staan worden niet overschreven. Maandtotalen (ook handmatig ingevulde) worden alleen vervangen als alle dagen van de maand berekend konden worden.</p></section>' +
       '<section class="panel"><h2>Instellingen</h2>' +
       '<div class="row"><input id="key" type="password" autocomplete="off" placeholder="Mijnbatterij API-sleutel (profielpagina)">' + knop('Opslaan', 'id="key-save"') + knop('Controleren', 'id="key-test"') + knop('Wissen', 'id="key-wis"') + '</div>' +
