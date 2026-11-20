@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BE Mijnbatterij
 // @namespace    paq.balansenergie
-// @version      1.4.0
+// @version      1.4.1
 // @description  Deelt accuresultaten van het Balans Energie-dashboard met mijnbatterij.nl, gesplitst in handel en besparing. Los van Balansenergie All-in; eigen pagina in het menu.
 // @homepageURL  https://github.com/paqpaqpaq/be_mijnbatterij
 // @updateURL    https://raw.githubusercontent.com/paqpaqpaq/be_mijnbatterij/main/userscript/BE-Mijnbatterij.user.js
@@ -157,7 +157,7 @@ function bembPage() {
   if (window.__bembLoaded) return;
   window.__bembLoaded = true;
 
-  var VERSIE = '1.4.0', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
+  var VERSIE = '1.4.1', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
   // Marge (procentpunt): twee verzenders met vrijwel volledige data mogen elkaar vervangen;
   // aanvullen naast HA gebeurt pas bij +1 pp, zodat ze niet pingpongen.
   var TOLERANTIE = 0.5;
@@ -809,6 +809,14 @@ function bembPage() {
     });
     return uit;
   }
+  // Status van de TenneT-prijzen van één afgelopen dag: compleet, of waarom niet.
+  async function tennetStatus(dk) {
+    await tennetPrijzen(dk);
+    try { if (+localStorage.getItem('bemb_tennet_geen') > Date.now() - 86400000) return { ok: false, browser: true, fout: 'deze browser stuurt de sessiecookie van TenneT niet mee (Safari/Userscripts) — gebruik Chrome of Home Assistant' }; } catch (e) {}
+    var st = await lees('nl:tennet:' + dk);
+    if (st && st.compleet) return { ok: true };
+    return { ok: false, fout: (st && (st.fout || (st.rows ? 'nog niet alle kwartieren gepubliceerd' : ''))) || 'geen antwoord' };
+  }
   async function prijzenDag(id, dk, alleenCache) { return metTennet(await prijsIndex(id), await tennetPrijzen(dk, alleenCache)); }
   function zetPrijzen(kw, prijzen) {
     Object.keys(kw).forEach(function (q) {
@@ -1159,11 +1167,33 @@ function bembPage() {
     try { var ba = await mb('GET', '/api/results/daily?from=' + dagen[0] + '&to=' + dagen[dagen.length - 1]), bj = JSON.parse(ba.text);
       ((bj && bj.results) || []).forEach(function (x) { if (x && x.date) bestaand[String(x.date).slice(0, 10)] = x; }); }
     catch (e) { res.fout = 'Mijnbatterij-records niet opgehaald: ' + e.message; histStroom(ym + '  ' + res.fout); return res; }
+    // Eerst controleren dat TenneT's settlementprijzen voor elke dag binnen zijn: zonder die prijzen
+    // rekent de plugin met benaderingen en zou hij verkeerde bedragen versturen. Dan niets versturen.
+    var tnWacht = {}, tnMist = [];
+    histStroom(ym + '  TenneT-prijzen controleren…');
+    for (var ti = 0; ti < dagen.length; ti++) {
+      if (historieStop) break;
+      var ts = await tennetStatus(dagen[ti]);
+      if (ts.ok) continue;
+      if (ts.browser) { res.fout = 'TenneT niet bereikbaar: ' + ts.fout; res.tennet = 'browser'; histStroom(ym + '  NIET verstuurd — ' + res.fout + '.'); historieStop = true; return res; }
+      // TenneT publiceert een dag pas na afloop; de laatste dagen kunnen nog ontbreken (volgt vanzelf).
+      if (dagen[ti] >= plusDagen(vk, -2)) tnWacht[dagen[ti]] = ts.fout;
+      else tnMist.push(dagen[ti] + ' (' + ts.fout + ')');
+    }
+    if (historieStop) { res.fout = 'gestopt'; histStroom(ym + '  gestopt.'); return res; }
+    if (tnMist.length) {
+      res.fout = 'TenneT-prijzen ontbreken voor ' + tnMist.length + ' dag(en)'; res.tennet = 'mist';
+      histStroom(ym + '  NIET verstuurd — TenneT-prijzen ontbreken voor: ' + tnMist.join(', ') + '. Probeer het later opnieuw.');
+      return res;
+    }
+    histStroom(ym + '  TenneT-prijzen compleet voor ' + (dagen.length - Object.keys(tnWacht).length) + '/' + dagen.length + ' dagen' +
+      (Object.keys(tnWacht).length ? ' (' + Object.keys(tnWacht).join(', ') + ' nog niet gepubliceerd — volgt)' : '') + '.');
     var som = { t: 0, b: 0, l: 0, o: 0, n: 0 }, alles = true, gestopt = false;
     for (var di = 0; di < dagen.length; di++) {
       var dk = dagen[di];
       if (historieStop) { gestopt = true; break; }
       if (histVoortgang) { histVoortgang.dag = di + 1; histVoortgang.dagen = dagen.length; toonVoortgang(); }
+      if (tnWacht[dk]) { res.wachtOpBE = (res.wachtOpBE || 0) + 1; histStroom(dk + '  TenneT-prijzen nog niet gepubliceerd (volgt vanzelf)'); continue; }
       var rij = rijVan(j, dk);
       if (!rij || rij.status !== 'complete') {
         // BE maakt een dag pas na ~48 uur definitief: de laatste dagen zijn nog niet klaar (verwacht).
@@ -1202,7 +1232,7 @@ function bembPage() {
     } else if (alles && som.n + nogBE === dagen.length) {
       // Lopende maand, of een net afgelopen maand waarvan BE de laatste dagen nog niet definitief heeft.
       res.st = c.proef ? 'proef' : 'lopend';
-      histStroom(ym + '  ' + som.n + ' dagen verwerkt' + (nogBE ? ', ' + nogBE + ' nog niet definitief bij BE' : '') + ' — maandtotaal volgt als de maand compleet is.');
+      histStroom(ym + '  ' + som.n + ' dagen verwerkt' + (nogBE ? ', ' + nogBE + ' nog niet definitief bij BE of TenneT' : '') + ' — maandtotaal volgt als de maand compleet is.');
     } else {
       res.st = 'deels';
       histStroom(ym + '  ' + som.n + '/' + dagen.length + ' dagen verwerkt; maandtotaal niet vervangen' + (res.overgeslagen ? ' (' + res.overgeslagen + ' niet bruikbaar)' : '') + '.');
