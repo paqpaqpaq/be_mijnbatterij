@@ -225,7 +225,12 @@ function bembPage() {
    * η wordt per installatie gemeten op momenten zonder PV (p en g ≈ 0): dan is
    * de huisbalans exact (accu AC = huis − net). Standaard = gemeten op 19-11-2026. */
   var ETA_STANDAARD = { uit: [0.945, 0.945, 0.881], in: [0.957, 0.957, 0.957] };
-  var ETA = ETA_STANDAARD;
+  // Vast rendement per installatie, afgeleid uit BE's eigen energiebalans (verbruik + teruglevering − import − zon
+  // tegen BE's DC-accucijfers, 73 volledige dagen jan/apr/nov 2026: uit 0,925, in 0,969, RTE 0,896). Elke browser en
+  // HA rekenen daardoor met hetzelfde rendement: dezelfde BE-data geeft overal hetzelfde resultaat. De eigen meting
+  // per browser (ETA_GEMETEN) blijft alleen ter informatie.
+  var ETA_VAST = { uit: [0.925, 0.925, 0.925], in: [0.969, 0.969, 0.969], vast: true };
+  var ETA = ETA_VAST, ETA_GEMETEN = null;
   function etaKlasse(w, laden) { var a = Math.abs(w); return laden ? (a < 3000 ? 0 : a < 7000 ? 1 : 2) : (a < 2000 ? 0 : a < 5000 ? 1 : 2); }
   function naarAC(bo, e) {
     e = e || ETA;
@@ -253,7 +258,10 @@ function bembPage() {
     }
     return { uit: richting('uit'), in: richting('in'), n: { uit: s.uit.map(function (c) { return c[2]; }), in: s.in.map(function (c) { return c[2]; }) } };
   }
-  function etaTekst(e) { return 'Omvormerrendement uit ' + e.uit.map(function (x) { return x.toFixed(2); }).join('/') + ', in ' + e.in.map(function (x) { return x.toFixed(2); }).join('/'); }
+  function etaTekst(e) {
+    var r = function (a) { return a.every(function (x) { return x === a[0]; }) ? a[0].toFixed(3) : a.map(function (x) { return x.toFixed(2); }).join('/'); };
+    return 'Omvormerrendement uit ' + r(e.uit) + ', in ' + r(e.in);
+  }
   function gatGrens(r) { return Math.max(120000, Math.min(Math.round((r || 0) * 1.5), 600000)); }
   // Tijdgewogen integratie naar kwartieren (kWh). Gaten worden nooit opgevuld.
   function naarKwartieren(rows, e) {
@@ -414,10 +422,10 @@ function bembPage() {
       onbekend: function (s) { return w.some(function (x) { return s >= x[0] && s < x[1]; }); } };
   }
 
-  if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger, vulOnbalans: vulOnbalans, tenergyAanvullen: tenergyAanvullen, prijsKeuze: prijsKeuze, zetActief: zetActief, tenergyVast: tenergyVast, zetPrijzen: zetPrijzen, parseDefinitief: parseDefinitief, marktPrijs: marktPrijs, extraVelden: extraVelden, dagPayload: dagPayload, metTennet: metTennet }; return; }
+  if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, ETA_VAST: ETA_VAST, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger, vulOnbalans: vulOnbalans, tenergyAanvullen: tenergyAanvullen, prijsKeuze: prijsKeuze, zetActief: zetActief, tenergyVast: tenergyVast, zetPrijzen: zetPrijzen, parseDefinitief: parseDefinitief, marktPrijs: marktPrijs, extraVelden: extraVelden, dagPayload: dagPayload, metTennet: metTennet }; return; }
   // Diagnose (alleen als localStorage 'bemb_debug' = '1'): rekenfuncties en gegevens bereikbaar via window.__bemb.
   try {
-    if (localStorage.getItem('bemb_debug') === '1') window.__bemb = Object.assign({ verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger, vulOnbalans: vulOnbalans, tenergyAanvullen: tenergyAanvullen, prijsKeuze: prijsKeuze, zetActief: zetActief, tenergyVast: tenergyVast, zetPrijzen: zetPrijzen, parseDefinitief: parseDefinitief, marktPrijs: marktPrijs, extraVelden: extraVelden, dagPayload: dagPayload }, {
+    if (localStorage.getItem('bemb_debug') === '1') window.__bemb = Object.assign({ verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, ETA_VAST: ETA_VAST, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger, vulOnbalans: vulOnbalans, tenergyAanvullen: tenergyAanvullen, prijsKeuze: prijsKeuze, zetActief: zetActief, tenergyVast: tenergyVast, zetPrijzen: zetPrijzen, parseDefinitief: parseDefinitief, marktPrijs: marktPrijs, extraVelden: extraVelden, dagPayload: dagPayload }, {
       cacheKwartieren: cacheKwartieren, haalDefinitief: haalDefinitief, prijsIndex: prijsIndex, tennetPrijzen: tennetPrijzen, prijzenDag: prijzenDag, brug: brug, klant: klant, dagDefinitief: dagDefinitief,
       maandBron: maandBron, rijVan: rijVan, cfg: cfg, lees: lees, k: k, versie: VERSIE });
   } catch (e) {}
@@ -563,10 +571,10 @@ function bembPage() {
   async function werkRendementBij(id, dagen) {
     var alle = [];
     for (var d of dagen) alle = alle.concat(((await lees(k(id, 'rauw:' + d))) || {}).rows || []);
-    ETA = kalibreer(alle);
-    try { localStorage.setItem('bemb_eta:' + id, JSON.stringify(ETA)); } catch (e) {}
+    ETA_GEMETEN = kalibreer(alle);
+    try { localStorage.setItem('bemb_eta:' + id, JSON.stringify(ETA_GEMETEN)); } catch (e) {}
   }
-  function laadRendement(id) { try { var e = JSON.parse(localStorage.getItem('bemb_eta:' + id) || 'null'); if (e && e.uit && e.in) ETA = e; } catch (x) {} }
+  function laadRendement(id) { try { var e = JSON.parse(localStorage.getItem('bemb_eta:' + id) || 'null'); if (e && e.uit && e.in) ETA_GEMETEN = e; } catch (x) {} }
   async function verzamelPrijzen(id) {
     await verwerkPrijzen(id, await beGet('/customer/current-prices/api/'));
     // Herstel: gaten van gisteren en vandaag gericht ophalen, hooguit eens per uur per dag.
@@ -1533,7 +1541,8 @@ function bembPage() {
         '<div class="tile"><small>Besparing</small><strong class="' + cls(w.besparing) + '">' + euro(w.besparing) + '</strong></div>' +
         '<div class="tile"><small>Accudekking</small><strong>' + pct(r.dekking) + '</strong><div class="sub">' + kwhT(w.geladen) + ' in · ' + kwhT(w.ontladen) + ' uit</div></div>';
       $('live-info').textContent = (laatsteLive ? 'live ' + (laatsteLive.p.test ? 'gevalideerd ' : 'verstuurd ') + klok(laatsteLive.at) : 'nog niet live verstuurd') +
-        (laatsteVerzameling ? ' · metingen ' + klok(laatsteVerzameling) : '') + (w.zonderPrijs ? ' · ' + w.zonderPrijs + ' kwartieren zonder prijs' : '') + ' · ' + etaTekst(ETA).toLowerCase() + (function () { var n = ETA.n ? ETA.n.uit.concat(ETA.n.in).reduce(function (a, b) { return a + b; }, 0) : 0; return n >= 100 ? ' (gemeten, n=' + n + ')' : ' (standaard' + (n ? ', ' + n + ' metingen, nog te weinig' : '') + ')'; })();
+        (laatsteVerzameling ? ' · metingen ' + klok(laatsteVerzameling) : '') + (w.zonderPrijs ? ' · ' + w.zonderPrijs + ' kwartieren zonder prijs' : '') + ' · ' + etaTekst(ETA).toLowerCase() + ' (vast, uit BE-data; RTE ' + (ETA.uit[0] * ETA.in[0]).toFixed(3) + ')' +
+          (ETA_GEMETEN && ETA_GEMETEN.n && ETA_GEMETEN.n.uit.concat(ETA_GEMETEN.n.in).reduce(function (a, b) { return a + b; }, 0) >= 100 ? ' · in deze browser gemeten: ' + etaTekst(ETA_GEMETEN).slice(20).toLowerCase() : '');
       var rijen = [];
       for (var i = 1; i <= DAG_VENSTER; i++) {
         var dk = plusDagen(vandaag(), -i), d = null, def = await lees(k(id, 'def:' + dk));
