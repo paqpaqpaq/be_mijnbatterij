@@ -109,6 +109,10 @@ def verdeel(po: float, bo: float) -> dict[str, float]:
 # DC × η_uit, laden AC = DC / η_in. η per installatie gemeten op momenten
 # zonder PV (p, g ≈ 0), waar accu AC = huis − net exact is.
 ETA_STANDAARD = {"uit": [0.945, 0.945, 0.881], "in": [0.957, 0.957, 0.957]}
+# Vast rendement per installatie, afgeleid uit BE's eigen energiebalans (verbruik + teruglevering − import − zon
+# tegen BE's DC-accucijfers; 73 volledige dagen jan/apr/nov 2026): uit 0,925, in 0,969, RTE 0,896. Gelijk aan de
+# plugin: dezelfde BE-data geeft in HA en in elke browser hetzelfde resultaat. De eigen meting blijft ter informatie.
+ETA_VAST = {"uit": [0.925, 0.925, 0.925], "in": [0.969, 0.969, 0.969], "vast": True}
 
 
 def eta_klasse(w: float, laden: bool) -> int:
@@ -168,8 +172,9 @@ def kalibreer(rows: list[dict]) -> dict:
 
 
 def eta_tekst(e: dict) -> str:
-    return ("Omvormerrendement uit " + "/".join(to_fixed(x, 2) for x in e["uit"])
-            + ", in " + "/".join(to_fixed(x, 2) for x in e["in"]))
+    def r(a: list) -> str:
+        return to_fixed(a[0], 3) if all(x == a[0] for x in a) else "/".join(to_fixed(x, 2) for x in a)
+    return "Omvormerrendement uit " + r(e["uit"]) + ", in " + r(e["in"])
 
 
 def gat_grens(res_ms: float | None) -> float:
@@ -512,51 +517,82 @@ def prijs_gaten(arch: dict[int, dict], start: int, tot: int) -> int:
 
 
 # ── TenneT-settlementprijzen (gelijk aan de plugin) ─────────────────────
-# Openbare publicatie (Oracle APEX) achter tennet.eu/nl-en/settlement-prices-graph: per dag, na
-# afloop, de tekort- en overschotprijs per kwartier. Getoetst tegen BE's market_breakdown: tot op de
-# cent gelijk aan wat BE als onbalans afrekent.
+# Openbare tabelpagina (Oracle APEX, pagina 90035) achter tennet.eu/nl-en/settlement-prices-table: per dag,
+# na afloop, de tekort- en overschotprijs per kwartier. Eén GET, datum in de URL, geen cookie. Getoetst tegen
+# BE's market_breakdown: tot op de cent gelijk aan wat BE als onbalans afrekent.
 TENNET_URL = "https://publications.tennet.eu/ords/"
+TENNET_REGIO = "93369768093509395"
 
 
-def _html_attr(s: str) -> str:
-    return s.replace("&#x2F;", "/").replace("&#x3D;", "=").replace("&quot;", '"').replace("&amp;", "&")
+def tennet_url(datum: str, regio: str | None) -> str:
+    return (f"{TENNET_URL}f?p=100:90035:0:{'pg_R_' + regio if regio else ''}:NO::P90035_PTU_DATE_LOC:{datum}"
+            + ("&pg_min_row=1&pg_max_rows=200&pg_rows_fetched=200" if regio else "") + "&p_lang=en")
 
 
-def tennet_pagina(html: str) -> dict:
-    """Sessie-instantie, salt, beveiligde velden en de ajax-sleutel van de grafiek uit de pagina."""
-    def veld(id_: str) -> str | None:
-        m = re.search(r'value="([^"]*)" id="' + id_ + '"', html) or re.search(r'id="' + id_ + r'"[^>]*value="([^"]*)"', html)
-        return _html_attr(m.group(1)) if m else None
-    inst, salt, prot = veld("pInstance"), veld("pSalt"), veld("pPageItemsProtected")
-    aj = re.search(r'jetChart\.init\("R\d+"[\s\S]*?,"(UkVH[^"]+)"\)', html)
-    if not inst or not salt or not prot or not aj or not inst.isdigit():
-        raise BronFout("TenneT-pagina onherkenbaar (opbouw gewijzigd?)")
-    return {"inst": inst, "salt": salt, "prot": prot, "ajax": aj.group(1).replace("\\u002F", "/")}
+class _TabelLezer(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.datum: str | None = None
+        self.kop: list[str] = []
+        self.rijen: list[list[str]] = []
+        self._in_th = self._in_td = self._in_tbody = False
+        self._cel: list[str] = []
+        self._rij: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        a = dict(attrs)
+        if a.get("id") == "P90035_PTU_DATE_LOC" and self.datum is None:  # <a-date-picker id=… value=…>
+            self.datum = a.get("value") or ""
+        elif tag == "tbody":
+            self._in_tbody = True
+        elif tag == "tr" and self._in_tbody:
+            self._rij = []
+        elif tag == "th":
+            self._in_th, self._cel = True, []
+        elif tag == "td" and self._rij is not None:
+            self._in_td, self._cel = True, []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "th" and self._in_th:
+            self.kop.append("".join(self._cel).strip().lower()); self._in_th = False
+        elif tag == "td" and self._in_td:
+            if self._rij is not None:
+                self._rij.append("".join(self._cel).strip())
+            self._in_td = False
+        elif tag == "tr" and self._rij is not None:
+            self.rijen.append(self._rij); self._rij = None
+        elif tag == "tbody":
+            self._in_tbody = False
+
+    def handle_data(self, data: str) -> None:
+        if self._in_th or self._in_td:
+            self._cel.append(data)
 
 
-def tennet_post(datum: str, pg: dict) -> dict[str, str]:
-    return {"p_flow_id": "100", "p_flow_step_id": "90030", "p_instance": pg["inst"], "p_debug": "",
-            "p_request": "PLUGIN=" + pg["ajax"],
-            "p_json": json.dumps({"pageItems": {"itemsToSubmit": [{"n": "P90030_PTU_DATE_LOC", "v": datum}],
-                                                "protected": pg["prot"], "rowVersion": "", "formRegionChecksums": []},
-                                  "salt": pg["salt"]}, separators=(",", ":"))}
+def _tennet_getal(x: str | None) -> float | None:
+    x = (x or "").replace(",", "").strip()
+    if not re.fullmatch(r"-?\d*\.?\d+", x):
+        return None
+    v = float(x)
+    return v if math.isfinite(v) else None
 
 
-def tennet_rijen(j: Any) -> dict[int, list]:
-    """Grafiekdata → {ISP-nummer: [tekort, overschot]} in €/MWh."""
-    if not isinstance(j, dict) or not isinstance(j.get("series"), list):
-        raise BronFout("TenneT-antwoord zonder reeksen")
+def tennet_tabel(html: str) -> dict:
+    """{datum, rijen: {ISP: [tekort, overschot]} (€/MWh), regio} uit de tabelpagina; leeg = nog niet gepubliceerd."""
+    t = _TabelLezer()
+    t.feed(html)
+    pag = re.search(r"apex\.widget\.report\.paginate\('(\d+)'", html)
+    i_t = next((i for i, k in enumerate(t.kop) if k.startswith("shortage")), -1)
+    i_o = next((i for i, k in enumerate(t.kop) if k.startswith("surplus")), -1)
+    if i_t < 0 and i_o < 0 and not t.kop and re.search(r'id="pFlowStepId"[^>]*value="90035"|value="90035"[^>]*id="pFlowStepId"', html):
+        return {"datum": None, "rijen": {}, "leeg": True, "regio": None}
+    if t.datum is None or i_t < 0 or i_o < 0:
+        raise BronFout("TenneT-tabel onherkenbaar (opbouw gewijzigd?)")
     rijen: dict[int, list] = {}
-    for s in j["series"]:
-        kol = 0 if isinstance(s, dict) and s.get("name") == "Shortage" else 1 if isinstance(s, dict) and s.get("name") == "Surplus" else -1
-        if kol < 0 or not isinstance(s.get("items"), list):
-            continue
-        for it in s["items"]:
-            m = re.match(r"^\s*(\d{3})-\d{2}:\d{2}\s*$", str((it or {}).get("name", "")))
-            v = (it or {}).get("value")
-            if m and isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v):
-                rijen.setdefault(int(m.group(1)), [None, None])[kol] = float(v)
-    return rijen
+    for r in t.rijen:
+        if r and r[0].isdigit() and len(r) > max(i_t, i_o):
+            rijen[int(r[0])] = [_tennet_getal(r[i_t]), _tennet_getal(r[i_o])]
+    return {"datum": t.datum, "rijen": rijen, "leeg": False, "regio": pag.group(1) if pag else None}
 
 
 def tennet_kwartieren(dk: str, rijen: dict[int, list]) -> tuple[dict[int, dict], bool]:

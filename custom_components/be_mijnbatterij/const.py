@@ -1,6 +1,6 @@
 """Constanten voor BE Mijnbatterij."""
 DOMAIN = "be_mijnbatterij"
-VERSIE = "1.4.0"
+VERSIE = "1.4.1"
 
 CONF_BE_USER = "be_username"
 CONF_BE_PASS = "be_password"
