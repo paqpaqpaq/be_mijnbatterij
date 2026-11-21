@@ -516,6 +516,48 @@ def prijs_gaten(arch: dict[int, dict], start: int, tot: int) -> int:
     return mist
 
 
+# ── Dynamisch tarief (EPEX day-ahead) voor geplande importkwartieren ──────
+# BE geeft voor ingeplande importkwartieren day_ahead_import: null (en bij aFRR ook
+# day_ahead_afrr_import: null). Net als Balansenergie All-in vullen we die met de kale EPEX-prijs
+# van Nord Pool NL (€/kWh, zonder EB/btw/opslag). Gelijk aan de plugin.
+NORDPOOL_URL = "https://dataportal-api.nordpoolgroup.com/api/DayAheadPrices"
+
+
+def nordpool_url(dk: str) -> str:
+    return f"{NORDPOOL_URL}?date={dk}&market=DayAhead&deliveryArea=NL&currency=EUR"
+
+
+def nordpool_rijen(body: Any) -> dict[int, float]:
+    """Nord Pool-antwoord → {kwartierstart (ms): prijs €/kWh}."""
+    if not isinstance(body, dict) or not isinstance(body.get("multiAreaEntries"), list):
+        raise BronFout("Onbekend Nord Pool-formaat")
+    if body.get("currency") != "EUR" or body.get("market") != "DayAhead" or "NL" not in (body.get("deliveryAreas") or []):
+        raise BronFout("Onbekende Nord Pool-markt")
+    uit: dict[int, float] = {}
+    for r in body["multiAreaEntries"]:
+        v = ((r or {}).get("entryPerArea") or {}).get("NL")
+        try:
+            prijs = float(v)
+            a = int(datetime.fromisoformat(str(r["deliveryStart"]).replace("Z", "+00:00")).timestamp() * 1000)
+            b = int(datetime.fromisoformat(str(r["deliveryEnd"]).replace("Z", "+00:00")).timestamp() * 1000)
+        except (TypeError, ValueError, KeyError):
+            continue
+        if not math.isfinite(prijs) or b - a != Q or a % Q:
+            raise BronFout("Onbekende Nord Pool-kwartiertijden")
+        uit[a] = prijs / 1000
+    return uit
+
+
+def vul_dag_ahead(arch: dict[int, dict], epex: dict[int, float]) -> int:
+    """Geplande importkwartieren (day_ahead_import / day_ahead_afrr_import) zonder prijs vullen met EPEX."""
+    n = 0
+    for q, a in arch.items():
+        if a.get("mi") in ("day_ahead_import", "day_ahead_afrr_import") and not getal(a.get("ki")) and getal(epex.get(int(q))):
+            a.update(ki=epex[int(q)], vi=True, ti=False, da="epex")
+            n += 1
+    return n
+
+
 # ── TenneT-settlementprijzen (gelijk aan de plugin) ─────────────────────
 # Openbare tabelpagina (Oracle APEX, pagina 90035) achter tennet.eu/nl-en/settlement-prices-table: per dag,
 # na afloop, de tekort- en overschotprijs per kwartier. Eén GET, datum in de URL, geen cookie. Getoetst tegen
