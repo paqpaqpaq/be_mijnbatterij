@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BE Mijnbatterij
 // @namespace    paq.balansenergie
-// @version      1.4.1
+// @version      1.4.2
 // @description  Deelt accuresultaten van het Balans Energie-dashboard met mijnbatterij.nl, gesplitst in handel en besparing. Los van Balansenergie All-in; eigen pagina in het menu.
 // @homepageURL  https://github.com/paqpaqpaq/be_mijnbatterij
 // @updateURL    https://raw.githubusercontent.com/paqpaqpaq/be_mijnbatterij/main/userscript/BE-Mijnbatterij.user.js
@@ -160,7 +160,7 @@ function bembPage() {
   window.__bembLoaded = true;
 
   var TENNET_PAGINA = 'https://publications.tennet.eu/ords/';
-  var VERSIE = '1.4.1', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
+  var VERSIE = '1.4.2', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
   // Marge (procentpunt): twee verzenders met vrijwel volledige data mogen elkaar vervangen;
   // aanvullen naast HA gebeurt pas bij +1 pp, zodat ze niet pingpongen.
   var TOLERANTIE = 0.5;
@@ -1074,7 +1074,8 @@ function bembPage() {
     var id = klant(), c = cfg(); if (!id) throw Error('Geen installatie bekend');
     if (!handmatig && (!c.auto || !heeftSleutel)) return;
     try { await controleerHA(false); } catch (e) {}
-    if (haNeemtOver(c)) throw Error('Home Assistant verstuurt (actief ' + klok(haStatus.at) + ').');
+    // Een handmatige 'Nu delen' is een opdracht: dan verstuurt de browser ook als Home Assistant de verzender is.
+    if (!handmatig && haNeemtOver(c)) throw Error('Home Assistant verstuurt (actief ' + klok(haStatus.at) + ').');
     return lock('bemb-live', async function () {
       var nu = Date.now(), dk = dagVan(nu);
       var rows = ((await lees(k(id, 'rauw:' + dk))) || {}).rows || [], m = null;
@@ -1089,6 +1090,8 @@ function bembPage() {
       if (c.proef) p.test = true;
       await mb('POST', '/api/live', p);
       laatsteLive = { at: Date.now(), p: p };
+      // Hartslag: Home Assistant laat live dan 25 minuten aan de browser (bij 'Nu delen' meteen, niet pas na 10 min).
+      if (handmatig) laatsteHartslag = 0;
       try { await browserHartslag(id, c); } catch (e) { noteer('Hartslag: ' + e.message); }
       noteer('Live ' + (c.proef ? 'gevalideerd (proef)' : 'verstuurd') + ': totaal € ' + p.batteryResult + ', besparing € ' + p.batterySavings + (p.invalid ? ' · onvolledig' : ''));
       render();
@@ -1131,7 +1134,8 @@ function bembPage() {
     try { await controleerHA(handmatig); } catch (e) { noteer('HA-controle: ' + e.message); }
     // Verstuurt Home Assistant, dan vult de browser alleen aan: dagen die er nog niet staan,
     // of die hij nauwkeuriger heeft (bijv. van vóór de HA-installatie, met meer eigen metingen).
-    var aanvullen = haNeemtOver(c);
+    // Bij 'Nu delen' geldt de gewone afweging (nooit een nauwkeuriger record overschrijven), niet het aanvullen.
+    var aanvullen = !handmatig && haNeemtOver(c);
     return lock('bemb-dagen', async function () {
       var rapport = [], vandaagK = vandaag(), dagen = [];
       for (var i = DAG_VENSTER; i >= 1; i--) dagen.push(plusDagen(vandaagK, -i));
@@ -1514,7 +1518,8 @@ function bembPage() {
     };
     $('nu').onclick = async function () {
       var b = $('nu'); b.disabled = true; status('Verzamelen en delen…');
-      try { await verzamel(); var uit = []; try { await liveRonde(true); uit.push('Live ok.'); } catch (e) { uit.push('Live: ' + e.message); } uit.push(await dagRonde(true) || 'Dagen: er loopt al een ronde.'); status(uit.join(' · ').slice(0, 400)); }
+      // Eerst de dagen (dan bestaat er een browserrecord voor de hartslag), daarna live.
+      try { await verzamel(); var uit = [await dagRonde(true) || 'Dagen: er loopt al een ronde.']; try { await liveRonde(true); uit.unshift('Live ok.'); } catch (e) { uit.unshift('Live: ' + e.message); } status(uit.join(' · ').slice(0, 400)); }
       catch (e) { status(e.message); } finally { b.disabled = false; render(); }
     };
     $('ververs').onclick = async function () { status('Verzamelen…'); await verzamel(); render(); status('Bijgewerkt ' + klok(Date.now()) + '.'); };
