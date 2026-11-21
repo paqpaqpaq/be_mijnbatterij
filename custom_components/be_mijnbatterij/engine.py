@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import Any, Awaitable, Callable
 
 from . import calc
-from .api import TenergyClient, TennetClient, BEClient, BEError, BERateLimited, MBClient, MBError
+from .api import EpexClient, TenergyClient, TennetClient, BEClient, BEError, BERateLimited, MBClient, MBError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,17 +40,19 @@ def _nu_ms() -> int:
 class Engine:
     def __init__(self, be: BEClient, mb: MBClient, state: dict, opties: dict, versie: str,
                  now_ms: Callable[[], int] = _nu_ms, slaap: Callable[[float], Awaitable[None]] = asyncio.sleep,
-                 tenergy: TenergyClient | None = None, tennet: TennetClient | None = None) -> None:
+                 tenergy: TenergyClient | None = None, tennet: TennetClient | None = None,
+                 epex: EpexClient | None = None) -> None:
         self.be, self.mb, self.versie = be, mb, versie
         self.tenergy = tenergy
         self.tennet = tennet
+        self.epex = epex
         self._tn_mem: dict[str, dict[int, dict]] = {}
         self.opties = opties
         self.now_ms = now_ms
         self.slaap = slaap
         self.s = state
         for key, leeg in (("kw", {}), ("prijzen", {}), ("def", {}), ("sent", {}), ("maand", {}), ("hersteld", {}),
-                          ("tenergy", {}), ("tenergy_act", {}), ("tennet", {})):
+                          ("tenergy", {}), ("tenergy_act", {}), ("tennet", {}), ("epex", {})):
             self.s.setdefault(key, leeg)
         self.s.setdefault("eta_som", calc.kalibratie_leeg())
         self.log: list[str] = []
@@ -175,6 +177,7 @@ class Engine:
                 arch = self.prijs_index()
                 calc.verwerk_prijzen(arch, await self.be.current_prices(), nu, self.s["tenergy"])
                 calc.tenergy_aanvullen(arch, self.s["tenergy"], nu, nu - 2 * 86_400_000)
+                await self._vul_epex(arch)
                 self._bewaar_prijzen(arch)
             except BERateLimited:
                 raise
@@ -206,6 +209,30 @@ class Engine:
         if calc.tenergy_aanvullen(arch, self.s["tenergy"], nu, nu - 2 * 86_400_000):
             self._bewaar_prijzen(arch)
 
+    async def _vul_epex(self, arch: dict[int, dict]) -> int:
+        """Geplande importkwartieren zonder prijs (BE gaf null) vullen met de kale EPEX-prijs (Nord Pool NL)."""
+        if not self.epex:
+            return 0
+        nu = self.now_ms()
+        dagen = sorted({calc.dag_van(int(q)) for q, a in arch.items()
+                        if a.get("mi") in ("day_ahead_import", "day_ahead_afrr_import") and not calc.getal(a.get("ki"))})
+        epex: dict[int, float] = {}
+        for dk in dagen:
+            st = self.s["epex"].get(dk)
+            if not (st and (st.get("rows") or nu / 1000 - st["at"] < 3600)):
+                try:
+                    rows = await self.epex.dag(dk)
+                    st = {"at": nu / 1000, "rows": {str(q): p for q, p in rows.items()}}
+                except (BEError, calc.BronFout) as err:
+                    self.noteer(f"EPEX {dk}: {err}")
+                    st = {"at": nu / 1000, "rows": {}}
+                self.s["epex"][dk] = st
+            epex.update({int(q): p for q, p in (st.get("rows") or {}).items()})
+        grens = calc.plus_dagen(calc.vandaag(nu), -PRIJS_DAGEN)
+        for oud in [d for d in self.s["epex"] if d < grens]:
+            del self.s["epex"][oud]
+        return calc.vul_dag_ahead(arch, epex)
+
     def _bewaar_prijzen(self, arch: dict[int, dict]) -> None:
         self.s["prijzen"] = {str(k): v for k, v in arch.items()}
 
@@ -230,6 +257,7 @@ class Engine:
             return
         arch = self.prijs_index()
         n = calc.verwerk_prijzen(arch, j, nu, self.s["tenergy"])
+        await self._vul_epex(arch)
         self._bewaar_prijzen(arch)
         self.s["hersteld"][dk] = nu / 1000
         na = calc.prijs_gaten(self.prijs_index(), start, tot)

@@ -233,3 +233,26 @@ class TennetClient:
         if t.get("datum") != datum:
             raise BEError(f"TenneT gaf {t.get('datum') or 'geen datum'} in plaats van {datum}")
         return t["rijen"]
+
+
+class EpexClient:
+    """Kale EPEX day-ahead-kwartierprijzen NL via Nord Pool (openbaar, alleen lezen), zoals All-in."""
+
+    def __init__(self, session: aiohttp.ClientSession) -> None:
+        self._s = session
+
+    async def dag(self, dk: str) -> dict[int, float]:
+        from . import calc
+        try:
+            async with self._s.get(calc.nordpool_url(dk), timeout=aiohttp.ClientTimeout(total=20),
+                                   headers={"User-Agent": "BE-Mijnbatterij-HA", "Accept": "application/json"}) as r:
+                if r.status == 204:
+                    return {}
+                if r.status != 200:
+                    raise BEError(f"Nord Pool HTTP {r.status}")
+                body = await r.json(content_type=None)
+            return calc.nordpool_rijen(body)
+        except (BEError, calc.BronFout):
+            raise
+        except Exception as err:  # noqa: BLE001 — een externe bron mag de integratie nooit stilleggen
+            raise BEError(f"Nord Pool niet bereikbaar ({type(err).__name__})") from err

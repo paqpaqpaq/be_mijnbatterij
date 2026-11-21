@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BE Mijnbatterij
 // @namespace    paq.balansenergie
-// @version      1.4.1
+// @version      1.4.2
 // @description  Deelt accuresultaten van het Balans Energie-dashboard met mijnbatterij.nl, gesplitst in handel en besparing. Los van Balansenergie All-in; eigen pagina in het menu.
 // @homepageURL  https://github.com/paqpaqpaq/be_mijnbatterij
 // @updateURL    https://raw.githubusercontent.com/paqpaqpaq/be_mijnbatterij/main/userscript/BE-Mijnbatterij.user.js
@@ -17,6 +17,7 @@
 // @grant        GM.setValue
 // @connect      api.mijnbatterij.nl
 // @connect      publications.tennet.eu
+// @connect      dataportal-api.nordpoolgroup.com
 // ==/UserScript==
 
 /* ─── Brug naar api.mijnbatterij.nl (userscriptlaag) ─────────────────────
@@ -102,6 +103,25 @@
     if (t.datum !== datum) return { ok: false, error: 'TenneT gaf ' + (t.datum || 'geen datum') + ' in plaats van ' + datum };
     return { ok: true, rijen: t.rijen };
   }
+  /* Kale EPEX day-ahead-kwartierprijzen NL via Nord Pool (openbaar, alleen lezen), zoals All-in. */
+  async function epexDag(dk) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dk)) return { ok: false, error: 'Ongeldige datum' };
+    var r = await gmReq({ method: 'GET', url: 'https://dataportal-api.nordpoolgroup.com/api/DayAheadPrices?date=' + dk + '&market=DayAhead&deliveryArea=NL&currency=EUR', headers: { 'Accept': 'application/json' } });
+    if (r.fout) return { ok: false, error: r.fout.replace('TenneT', 'Nord Pool') };
+    if (r.status === 204) return { ok: true, rows: {} };
+    if (r.status !== 200) return { ok: false, error: 'Nord Pool HTTP ' + r.status };
+    var b; try { b = JSON.parse(r.text); } catch (e) { return { ok: false, error: 'Nord Pool gaf geen JSON' }; }
+    if (!b || !Array.isArray(b.multiAreaEntries)) return { ok: false, error: 'Onbekend Nord Pool-formaat' };
+    if (b.currency !== 'EUR' || b.market !== 'DayAhead' || !(b.deliveryAreas || []).includes('NL')) return { ok: false, error: 'Onbekende Nord Pool-markt' };
+    var rows = {};
+    for (var i = 0; i < b.multiAreaEntries.length; i++) {
+      var e = b.multiAreaEntries[i] || {}, v = Number((e.entryPerArea || {}).NL), a = Date.parse(e.deliveryStart), z = Date.parse(e.deliveryEnd);
+      if (!isFinite(v) || !isFinite(a)) continue;
+      if (z - a !== 900000 || a % 900000) return { ok: false, error: 'Onbekende Nord Pool-kwartiertijden' };
+      rows[a] = v / 1000;
+    }
+    return { ok: true, rows: rows };
+  }
   var GET_OK = /^\/api\/me$|^\/api\/results\/(?:daily|monthly)\?from=\d{4}-\d{2}(?:-\d{2})?&to=\d{4}-\d{2}(?:-\d{2})?$/;
   var POST_OK = /^\/api\/(?:live|results\/daily|results\/monthly)$/;
 
@@ -120,6 +140,7 @@
         await setKey(nieuw); answer({ ok: true, hasKey: !!nieuw }); return;
       }
       if (v.op === 'tennet') { answer(await tennetDag(String(v.datum || ''))); return; }
+      if (v.op === 'epex') { answer(await epexDag(String(v.dag || ''))); return; }
       if (v.op !== 'api') return;
       var method = v.method === 'POST' ? 'POST' : 'GET';
       if (method === 'GET' ? !GET_OK.test(v.path) || v.body : !POST_OK.test(v.path) || !v.body) { answer({ ok: false, error: 'Verzoek niet toegestaan' }); return; }
@@ -160,7 +181,7 @@ function bembPage() {
   window.__bembLoaded = true;
 
   var TENNET_PAGINA = 'https://publications.tennet.eu/ords/';
-  var VERSIE = '1.4.1', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
+  var VERSIE = '1.4.2', Q = 900000, HASH = '#be-mijnbatterij', TZ = 'Europe/Amsterdam';
   // Marge (procentpunt): twee verzenders met vrijwel volledige data mogen elkaar vervangen;
   // aanvullen naast HA gebeurt pas bij +1 pp, zodat ze niet pingpongen.
   var TOLERANTIE = 0.5;
@@ -422,11 +443,11 @@ function bembPage() {
       onbekend: function (s) { return w.some(function (x) { return s >= x[0] && s < x[1]; }); } };
   }
 
-  if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, ETA_VAST: ETA_VAST, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger, vulOnbalans: vulOnbalans, tenergyAanvullen: tenergyAanvullen, prijsKeuze: prijsKeuze, zetActief: zetActief, tenergyVast: tenergyVast, zetPrijzen: zetPrijzen, parseDefinitief: parseDefinitief, marktPrijs: marktPrijs, extraVelden: extraVelden, dagPayload: dagPayload, metTennet: metTennet }; return; }
+  if (window.__BEMB_TEST__) { window.__BEMB_TEST__ = { verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, ETA_VAST: ETA_VAST, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger, vulOnbalans: vulOnbalans, tenergyAanvullen: tenergyAanvullen, prijsKeuze: prijsKeuze, zetActief: zetActief, tenergyVast: tenergyVast, zetPrijzen: zetPrijzen, parseDefinitief: parseDefinitief, marktPrijs: marktPrijs, extraVelden: extraVelden, dagPayload: dagPayload, metTennet: metTennet, vulEpex: vulEpex }; return; }
   // Diagnose (alleen als localStorage 'bemb_debug' = '1'): rekenfuncties en gegevens bereikbaar via window.__bemb.
   try {
     if (localStorage.getItem('bemb_debug') === '1') window.__bemb = Object.assign({ verdeel: verdeel, naarKwartieren: naarKwartieren, waardeer: waardeer, verdeelDefinitief: verdeelDefinitief, allin: allin, grenzen: grenzen, isoAms: isoAms, prijsKeuze: prijsKeuze, planning: planning, parseDefinitief: parseDefinitief, kiesPrijzen: kiesPrijzen, allinMetingen: allinMetingen, kalibreer: kalibreer, naarAC: naarAC, ETA_STANDAARD: ETA_STANDAARD, ETA_VAST: ETA_VAST, dagPayload: dagPayload, maakLabel: maakLabel, leesLabel: leesLabel, magOverschrijven: magOverschrijven, kwaliteit: kwaliteit, nauwkeuriger: nauwkeuriger, vulOnbalans: vulOnbalans, tenergyAanvullen: tenergyAanvullen, prijsKeuze: prijsKeuze, zetActief: zetActief, tenergyVast: tenergyVast, zetPrijzen: zetPrijzen, parseDefinitief: parseDefinitief, marktPrijs: marktPrijs, extraVelden: extraVelden, dagPayload: dagPayload }, {
-      cacheKwartieren: cacheKwartieren, haalDefinitief: haalDefinitief, prijsIndex: prijsIndex, tennetPrijzen: tennetPrijzen, prijzenDag: prijzenDag, brug: brug, klant: klant, dagDefinitief: dagDefinitief,
+      cacheKwartieren: cacheKwartieren, haalDefinitief: haalDefinitief, prijsIndex: prijsIndex, vulEpex: vulEpex, tennetPrijzen: tennetPrijzen, prijzenDag: prijzenDag, brug: brug, klant: klant, dagDefinitief: dagDefinitief,
       maandBron: maandBron, rijVan: rijVan, cfg: cfg, lees: lees, k: k, versie: VERSIE });
   } catch (e) {}
 
@@ -640,6 +661,29 @@ function bembPage() {
     });
     return n;
   }
+  // Dynamisch tarief: BE geeft voor ingeplande importkwartieren day_ahead_import (en bij aFRR
+  // day_ahead_afrr_import) = null. Net als All-in en Home Assistant vullen we die met de kale EPEX-prijs
+  // van Nord Pool NL, zodat browser en HA hetzelfde rekenen. Per dag één keer ophalen.
+  async function vulEpex(arch) {
+    var nu = Date.now(), dagen = {};
+    Object.keys(arch).forEach(function (q) { var a = arch[q]; if ((a.mi === 'day_ahead_import' || a.mi === 'day_ahead_afrr_import') && !getal(a.ki)) dagen[dagVan(+q)] = true; });
+    var epex = {}, n = 0;
+    for (var dk of Object.keys(dagen)) {
+      var sk = 'nl:epex:' + dk, st = await lees(sk);
+      if (!(st && st.v === 1 && (Object.keys(st.rows || {}).length || nu - st.at < 3600000))) {
+        var a; try { a = await brug({ op: 'epex', dag: dk }); } catch (e) { a = { ok: false, error: e.message }; }
+        if (!a || !a.ok) noteer('EPEX ' + dk + ': ' + ((a && a.error) || 'geen antwoord'));
+        st = { v: 1, at: nu, rows: (a && a.ok && a.rows) || {} };
+        await schrijf(sk, st);
+      }
+      Object.assign(epex, st.rows);
+    }
+    Object.keys(arch).forEach(function (q) {
+      var a = arch[q];
+      if ((a.mi === 'day_ahead_import' || a.mi === 'day_ahead_afrr_import') && !getal(a.ki) && getal(epex[q])) { a.ki = epex[q]; a.vi = true; a.ti = false; a.da = 'epex'; n++; }
+    });
+    return n;
+  }
   async function verwerkPrijzen(id, j) {
     if (!j || !Array.isArray(j.prices)) return;
     var ten = tenergyCache();
@@ -665,6 +709,7 @@ function bembPage() {
       };
     });
     tenergyAanvullen(arch, ten, nu, nu - 2 * 86400000);
+    try { await vulEpex(arch); } catch (e) { noteer('EPEX: ' + e.message); }
     var grens = nu - PRIJS_DAGEN * 86400000;
     Object.keys(arch).forEach(function (s) { if (+s < grens) delete arch[s]; });
     await schrijf(k(id, 'prijzen'), { rows: arch });
@@ -1074,7 +1119,8 @@ function bembPage() {
     var id = klant(), c = cfg(); if (!id) throw Error('Geen installatie bekend');
     if (!handmatig && (!c.auto || !heeftSleutel)) return;
     try { await controleerHA(false); } catch (e) {}
-    if (haNeemtOver(c)) throw Error('Home Assistant verstuurt (actief ' + klok(haStatus.at) + ').');
+    // Een handmatige 'Nu delen' is een opdracht: dan verstuurt de browser ook als Home Assistant de verzender is.
+    if (!handmatig && haNeemtOver(c)) throw Error('Home Assistant verstuurt (actief ' + klok(haStatus.at) + ').');
     return lock('bemb-live', async function () {
       var nu = Date.now(), dk = dagVan(nu);
       var rows = ((await lees(k(id, 'rauw:' + dk))) || {}).rows || [], m = null;
@@ -1089,6 +1135,8 @@ function bembPage() {
       if (c.proef) p.test = true;
       await mb('POST', '/api/live', p);
       laatsteLive = { at: Date.now(), p: p };
+      // Hartslag: Home Assistant laat live dan 25 minuten aan de browser (bij 'Nu delen' meteen, niet pas na 10 min).
+      if (handmatig) laatsteHartslag = 0;
       try { await browserHartslag(id, c); } catch (e) { noteer('Hartslag: ' + e.message); }
       noteer('Live ' + (c.proef ? 'gevalideerd (proef)' : 'verstuurd') + ': totaal € ' + p.batteryResult + ', besparing € ' + p.batterySavings + (p.invalid ? ' · onvolledig' : ''));
       render();
@@ -1131,7 +1179,8 @@ function bembPage() {
     try { await controleerHA(handmatig); } catch (e) { noteer('HA-controle: ' + e.message); }
     // Verstuurt Home Assistant, dan vult de browser alleen aan: dagen die er nog niet staan,
     // of die hij nauwkeuriger heeft (bijv. van vóór de HA-installatie, met meer eigen metingen).
-    var aanvullen = haNeemtOver(c);
+    // Bij 'Nu delen' geldt de gewone afweging (nooit een nauwkeuriger record overschrijven), niet het aanvullen.
+    var aanvullen = !handmatig && haNeemtOver(c);
     return lock('bemb-dagen', async function () {
       var rapport = [], vandaagK = vandaag(), dagen = [];
       for (var i = DAG_VENSTER; i >= 1; i--) dagen.push(plusDagen(vandaagK, -i));
@@ -1514,7 +1563,8 @@ function bembPage() {
     };
     $('nu').onclick = async function () {
       var b = $('nu'); b.disabled = true; status('Verzamelen en delen…');
-      try { await verzamel(); var uit = []; try { await liveRonde(true); uit.push('Live ok.'); } catch (e) { uit.push('Live: ' + e.message); } uit.push(await dagRonde(true) || 'Dagen: er loopt al een ronde.'); status(uit.join(' · ').slice(0, 400)); }
+      // Eerst de dagen (dan bestaat er een browserrecord voor de hartslag), daarna live.
+      try { await verzamel(); var uit = [await dagRonde(true) || 'Dagen: er loopt al een ronde.']; try { await liveRonde(true); uit.unshift('Live ok.'); } catch (e) { uit.unshift('Live: ' + e.message); } status(uit.join(' · ').slice(0, 400)); }
       catch (e) { status(e.message); } finally { b.disabled = false; render(); }
     };
     $('ververs').onclick = async function () { status('Verzamelen…'); await verzamel(); render(); status('Bijgewerkt ' + klok(Date.now()) + '.'); };

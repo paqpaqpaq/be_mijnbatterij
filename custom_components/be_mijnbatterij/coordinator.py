@@ -14,7 +14,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from . import calc
-from .api import BEAuthError, BEClient, BEError, BERateLimited, MBAuthError, MBClient, MBError, TenergyClient, TennetClient
+from .api import BEAuthError, BEClient, BEError, BERateLimited, MBAuthError, EpexClient, MBClient, MBError, TenergyClient, TennetClient
 from .const import DOMAIN, LIVE_S, POLL_S, STANDAARD_OPTIES, VERSIE
 from .engine import DAGRONDE_S, HEARTBEAT_S, Engine
 
@@ -30,6 +30,7 @@ class BEMBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._be, self._mb = be, mb
         self._tenergy = TenergyClient(async_get_clientsession(hass))
         self._tennet = TennetClient(async_get_clientsession(hass))
+        self._epex = EpexClient(async_get_clientsession(hass))
         self._laatste_live = 0.0
         self.fout: str = ""
 
@@ -38,7 +39,7 @@ class BEMBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_laad(self) -> None:
         state = await self.store.async_load() or {}
-        self.engine = Engine(self._be, self._mb, state, self.opties(), VERSIE, tenergy=self._tenergy, tennet=self._tennet)
+        self.engine = Engine(self._be, self._mb, state, self.opties(), VERSIE, tenergy=self._tenergy, tennet=self._tennet, epex=self._epex)
 
     def bewaar(self) -> None:
         self.store.async_delay_save(lambda: self.engine.s if self.engine else {}, 30)
